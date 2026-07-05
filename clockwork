@@ -3,16 +3,25 @@
 clockwork — analyze Claude Code / Codex session activity.
 
 Usage:
-  clockwork <provider> <project-path> [idle-min]   Analyze one project
-  clockwork <provider> all [idle-min]              Rank all projects
-  clockwork <provider> list                        List project folders
+  clockwork <provider> <project-path> [idle-min] [options]  Analyze one project
+  clockwork <provider> all [idle-min] [options]             Rank all projects
+  clockwork <provider> list [options]                       List project folders
 
   <provider> is one of: claude | codex
+
+Options:
+  --json            Emit machine-readable JSON instead of ASCII tables
+  --since <when>    Only count prompts on/after this point in time
+  --until <when>    Only count prompts on/before this point in time
+                    <when> is YYYY-MM-DD, an ISO timestamp, or a relative
+                    form like 7d (7 days ago) or 2w (2 weeks ago)
 
 Examples:
   clockwork claude ~/code/myproject
   clockwork codex ~/code/myproject 45
-  clockwork codex all
+  clockwork codex all --json
+  clockwork claude all --since 7d
+  clockwork claude ~/code/myproject --since 2026-07-01 --until 2026-07-05
   clockwork claude list
 
 Data sources:
@@ -23,6 +32,7 @@ Data sources:
 import sys
 import json
 import os
+import re
 import glob
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -102,6 +112,55 @@ def _parse_ts(value):
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _parse_date_bound(value, end_of_day=False):
+    """Parse a --since/--until value into a UTC-aware datetime.
+
+    Accepts a relative form (`7d`, `2w`) meaning that many days/weeks before
+    now, a bare ISO date (`YYYY-MM-DD`), or a full ISO timestamp. A bare date
+    used as an upper bound snaps to the end of that day so the day is inclusive.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    m = re.fullmatch(r"(\d+)([dw])", value.lower())
+    if m:
+        n = int(m.group(1))
+        delta = timedelta(weeks=n) if m.group(2) == "w" else timedelta(days=n)
+        return datetime.now(timezone.utc) - delta
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return dt
+    except ValueError:
+        pass
+    dt = _parse_ts(value)
+    if dt is None:
+        raise ValueError(
+            f"unrecognized date {value!r} (use YYYY-MM-DD, an ISO timestamp, "
+            f"or a relative form like 7d / 2w)"
+        )
+    return dt
+
+
+def _filter_timestamps(timestamps, since, until):
+    """Keep only timestamps within [since, until] (either bound may be None)."""
+    if since is None and until is None:
+        return timestamps
+    return [
+        ts for ts in timestamps
+        if (since is None or ts >= since) and (until is None or ts <= until)
+    ]
+
+
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def _print_json(obj):
+    print(json.dumps(obj, indent=2))
 
 
 # --------------------------------------------------------------------------- #
@@ -306,10 +365,17 @@ PROVIDERS = {
 # Output modes
 # --------------------------------------------------------------------------- #
 
-def analyze_single(provider, project_path, idle_threshold):
+def analyze_single(provider, project_path, idle_threshold, since, until, as_json):
     label, count, timestamps = PROVIDERS[provider]["single"](project_path)
+    timestamps = _filter_timestamps(timestamps, since, until)
 
     if count == 0:
+        if as_json:
+            _print_json({
+                "provider": provider, "project": project_path,
+                "error": "no sessions found", "prompts": 0, "days": [],
+            })
+            sys.exit(1)
         print(f"❌ No {provider} sessions found for: {project_path}")
         projects = PROVIDERS[provider]["list"]()
         if projects:
@@ -319,10 +385,15 @@ def analyze_single(provider, project_path, idle_threshold):
         sys.exit(1)
 
     if not timestamps:
-        print("No user prompts found in session files.")
+        if as_json:
+            _print_json({
+                "provider": provider, "project": project_path, "label": label,
+                "session_files": count, "since": _iso(since), "until": _iso(until),
+                "prompts": 0, "days": [],
+            })
+            sys.exit(0)
+        print("No user prompts found in the selected range.")
         sys.exit(0)
-
-    print(f"✅ Found {count} session file(s) for: {label}\n")
 
     daily, sessions = compute_active_hours(timestamps, idle_threshold)
 
@@ -330,6 +401,37 @@ def analyze_single(provider, project_path, idle_threshold):
     first_ts = timestamps[0]
     last_ts = timestamps[-1]
     span_days = (last_ts.date() - first_ts.date()).days + 1
+
+    prompts_per_day = defaultdict(int)
+    for ts in timestamps:
+        prompts_per_day[ts.date()] += 1
+
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "project": project_path,
+            "label": label,
+            "session_files": count,
+            "idle_threshold_min": idle_threshold,
+            "since": _iso(since),
+            "until": _iso(until),
+            "first": _iso(first_ts),
+            "last": _iso(last_ts),
+            "span_days": span_days,
+            "prompts": len(timestamps),
+            "sessions": len(sessions),
+            "active_days": len(daily),
+            "total_minutes": round(total_minutes, 2),
+            "days": [
+                {"date": str(day),
+                 "minutes": round(daily[day], 2),
+                 "prompts": prompts_per_day[day]}
+                for day in sorted(daily)
+            ],
+        })
+        return
+
+    print(f"✅ Found {count} session file(s) for: {label}\n")
 
     print("=" * 52)
     print(f"  CLOCKWORK — {provider.upper()} SESSION ANALYSIS")
@@ -348,10 +450,6 @@ def analyze_single(provider, project_path, idle_threshold):
     print("-" * 52)
 
     max_mins = max(daily.values())
-    prompts_per_day = defaultdict(int)
-    for ts in timestamps:
-        prompts_per_day[ts.date()] += 1
-
     for day in sorted(daily):
         mins = daily[day]
         bar_len = int((mins / max_mins) * 20) if max_mins else 0
@@ -363,11 +461,8 @@ def analyze_single(provider, project_path, idle_threshold):
     print()
 
 
-def analyze_all(provider, idle_threshold):
+def analyze_all(provider, idle_threshold, since, until, as_json):
     projects = PROVIDERS[provider]["all"]()
-    if not projects:
-        print(f"❌ No {provider} projects with activity found ({PROVIDERS[provider]['location']})")
-        sys.exit(1)
 
     rows = []
     grand_minutes = 0.0
@@ -375,6 +470,9 @@ def analyze_all(provider, idle_threshold):
     grand_sessions = 0
 
     for label, timestamps in projects:
+        timestamps = _filter_timestamps(timestamps, since, until)
+        if not timestamps:
+            continue
         daily, sessions = compute_active_hours(timestamps, idle_threshold)
         total_minutes = sum(daily.values())
         rows.append({
@@ -387,7 +485,41 @@ def analyze_all(provider, idle_threshold):
         grand_prompts += len(timestamps)
         grand_sessions += len(sessions)
 
+    if not rows:
+        if as_json:
+            _print_json({
+                "provider": provider, "since": _iso(since), "until": _iso(until),
+                "projects": [],
+                "totals": {"projects": 0, "minutes": 0, "prompts": 0, "sessions": 0},
+            })
+            sys.exit(1)
+        print(f"❌ No {provider} projects with activity found ({PROVIDERS[provider]['location']})")
+        sys.exit(1)
+
     rows.sort(key=lambda r: r["minutes"], reverse=True)
+
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "idle_threshold_min": idle_threshold,
+            "since": _iso(since),
+            "until": _iso(until),
+            "projects": [
+                {"project": r["label"],
+                 "minutes": round(r["minutes"], 2),
+                 "prompts": r["prompts"],
+                 "sessions": r["sessions"]}
+                for r in rows
+            ],
+            "totals": {
+                "projects": len(rows),
+                "minutes": round(grand_minutes, 2),
+                "prompts": grand_prompts,
+                "sessions": grand_sessions,
+            },
+        })
+        return
+
     max_mins = max(r["minutes"] for r in rows)
 
     print("=" * 78)
@@ -415,8 +547,15 @@ def analyze_all(provider, idle_threshold):
     print()
 
 
-def list_projects(provider):
+def list_projects(provider, as_json):
     projects = PROVIDERS[provider]["list"]()
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "location": PROVIDERS[provider]["location"],
+            "projects": projects,
+        })
+        sys.exit(0 if projects else 1)
     if not projects:
         print(f"❌ No {provider} projects found ({PROVIDERS[provider]['location']})")
         sys.exit(1)
@@ -426,26 +565,64 @@ def list_projects(provider):
     print()
 
 
+def _die(msg):
+    print(f"clockwork: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _parse_args(argv):
+    """Split flags from positionals. Returns (positionals, opts)."""
+    opts = {"json": False, "since": None, "until": None}
+    positionals = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            opts["json"] = True
+        elif a in ("--since", "--until"):
+            i += 1
+            if i >= len(argv):
+                _die(f"{a} requires a value")
+            opts[a[2:]] = argv[i]
+        elif a.startswith("--since="):
+            opts["since"] = a.split("=", 1)[1]
+        elif a.startswith("--until="):
+            opts["until"] = a.split("=", 1)[1]
+        elif a.startswith("--"):
+            _die(f"unknown option: {a}")
+        else:
+            positionals.append(a)
+        i += 1
+    return positionals, opts
+
+
 def main():
-    if len(sys.argv) < 3:
+    positionals, opts = _parse_args(sys.argv[1:])
+    if len(positionals) < 2:
         print(__doc__.strip())
         sys.exit(1)
 
-    provider = sys.argv[1].lower()
+    provider = positionals[0].lower()
     if provider not in PROVIDERS:
-        print(f"Unknown provider: {sys.argv[1]!r} (expected 'claude' or 'codex')\n")
+        print(f"Unknown provider: {positionals[0]!r} (expected 'claude' or 'codex')\n")
         print(__doc__.strip())
         sys.exit(1)
 
-    target = sys.argv[2]
-    idle_threshold = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+    target = positionals[1]
+    idle_threshold = int(positionals[2]) if len(positionals) > 2 else 30
+
+    try:
+        since = _parse_date_bound(opts["since"])
+        until = _parse_date_bound(opts["until"], end_of_day=True)
+    except ValueError as e:
+        _die(str(e))
 
     if target == "all":
-        analyze_all(provider, idle_threshold)
+        analyze_all(provider, idle_threshold, since, until, opts["json"])
     elif target == "list":
-        list_projects(provider)
+        list_projects(provider, opts["json"])
     else:
-        analyze_single(provider, target, idle_threshold)
+        analyze_single(provider, target, idle_threshold, since, until, opts["json"])
 
 
 if __name__ == "__main__":
