@@ -73,11 +73,18 @@ ln -s "$PWD/clockwork" ~/.local/bin/clockwork
 ## Usage
 
 ```
-clockwork <provider> <project-path> [idle-min]   Analyze one project
-clockwork <provider> all [idle-min]              Rank all projects
-clockwork <provider> list                        List project folders
+clockwork <provider> <project-path> [idle-min] [options]  Analyze one project
+clockwork <provider> all [idle-min] [options]             Rank all projects
+clockwork <provider> list [options]                       List project folders
 
   <provider> is one of: claude | codex
+
+Options:
+  --json            Emit machine-readable JSON instead of ASCII tables
+  --since <when>    Only count prompts on/after this point in time
+  --until <when>    Only count prompts on/before this point in time
+                    <when> is YYYY-MM-DD, an ISO timestamp, or a relative
+                    form like 7d (7 days ago) or 2w (2 weeks ago)
 ```
 
 ### Examples
@@ -94,11 +101,35 @@ clockwork codex all
 
 # List the projects clockwork can see
 clockwork claude list
+
+# Only the last 7 days, across all projects
+clockwork claude all --since 7d
+
+# A specific date range for one project
+clockwork claude ~/dev/myproject --since 2026-07-01 --until 2026-07-05
+
+# Machine-readable output — pipe into jq, a spreadsheet, or a dashboard
+clockwork codex all --json | jq '.projects[] | {project, minutes}'
 ```
 
 The optional trailing number overrides the idle threshold in minutes
 (default `30`). A larger threshold merges short breaks into one session; a
 smaller one splits work into more, shorter sessions.
+
+### Filtering by date
+
+`--since` and `--until` restrict which prompts are counted. Each accepts a
+bare date (`2026-07-01`), a full ISO timestamp, or a relative form — `7d`
+(7 days ago) or `2w` (2 weeks ago). A bare `--until` date is inclusive of the
+whole day. This works in every mode (`<project>`, `all`, and `list`-adjacent
+analysis).
+
+### JSON output
+
+`--json` swaps the ASCII tables for structured JSON on stdout (errors and
+usage still go to stderr), so clockwork composes with `jq`, cron jobs, or any
+dashboard. Exit codes are script-friendly: `0` on success, `1` when nothing
+matched, `2` for bad arguments.
 
 ## License
 
