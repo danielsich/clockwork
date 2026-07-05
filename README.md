@@ -77,6 +77,7 @@ clockwork <provider> <project-path> [idle-min] [options]  Analyze one project
 clockwork <provider> all [idle-min] [options]             Rank all projects
 clockwork <provider> today [idle-min] [options]           Today, all projects
 clockwork <provider> week [idle-min] [options]            Last 7 days, all projects
+clockwork <provider> export [idle-min] [options]          Bundle all projects as JSON
 clockwork <provider> list [options]                       List project folders
 
   <provider> is one of: claude | codex
@@ -87,6 +88,8 @@ Options:
   --until <when>    Only count prompts on/before this point in time
                     <when> is YYYY-MM-DD, an ISO timestamp, or a relative
                     form like 7d (7 days ago) or 2w (2 weeks ago)
+  --detail <level>  export granularity: raw | sessions | daily (default raw)
+  --anonymize       export: replace project paths with a hash id + generic name
 ```
 
 ### Examples
@@ -147,6 +150,75 @@ analysis).
 usage still go to stderr), so clockwork composes with `jq`, cron jobs, or any
 dashboard. Exit codes are script-friendly: `0` on success, `1` when nothing
 matched, `2` for bad arguments.
+
+## Exporting for external tools
+
+`clockwork <provider> export` writes a single **self-describing, versioned**
+JSON bundle covering every project at once — the format a companion web app or
+dashboard would ingest. Unlike `--json` on the analysis commands (which emits
+one pre-aggregated view), the export is designed to be re-analyzed downstream.
+
+```bash
+# Full-fidelity export you can re-analyze anywhere
+clockwork claude export > clockwork.json
+
+# Smaller / shareable: grouped sessions only, with paths stripped
+clockwork codex export --detail sessions --anonymize > share.json
+
+# Export honors --since/--until too
+clockwork claude export --since 30d > last-month.json
+```
+
+**Detail levels** (`--detail`, default `raw`). Each level is a superset of the
+one below, so a consumer can start with the aggregates and drill down:
+
+| Level | Adds | Lets a consumer… |
+| ----- | ---- | ---------------- |
+| `daily` | per-day `minutes` / `prompts` | draw timelines and totals |
+| `sessions` | grouped `sessions` (start/end + prompt count) | re-bucket by timezone / date range |
+| `raw` | every prompt as an epoch-second timestamp | re-apply **any** idle threshold, build hour-of-day heatmaps, streaks — anything |
+
+**Privacy.** Paths are included by default (it's your own data). `--anonymize`
+drops the `path`, renames projects to `project-N`, and keeps only a stable
+hash `id` — so an uploaded file leaks nothing identifying while still letting a
+tool tell projects apart across exports.
+
+### Export schema (`clockwork/v1`)
+
+```jsonc
+{
+  "schema": "clockwork/v1",
+  "generated_at": "2026-07-06T00:30:00+02:00",  // local ISO-8601
+  "provider": "claude",
+  "idle_threshold_min": 30,
+  "detail": "raw",           // raw | sessions | daily
+  "anonymized": false,
+  "daily_tz": "UTC",         // the "daily" buckets use UTC calendar dates
+  "since": null,             // ISO bound if --since was given, else null
+  "until": null,
+  "projects": [
+    {
+      "id": "0ac6be84",      // stable sha1(path) prefix; survives --anonymize
+      "name": "myproject",   // basename, or "project-N" when anonymized
+      "path": "/Users/you/dev/myproject",   // omitted when anonymized
+      "totals": {
+        "minutes": 1234.76, "prompts": 1646, "sessions": 27,
+        "active_days": 12,
+        "first": 1780521570, "last": 1782130426   // epoch seconds
+      },
+      "daily":    [ { "date": "2026-06-03", "minutes": 4.34, "prompts": 27 } ],
+      "sessions": [ { "start": 1780521570, "end": 1780521830,
+                      "minutes": 4.34, "prompts": 27 } ],  // detail >= sessions
+      "prompts":  [ 1780521570, 1780521582 ]               // detail == raw
+    }
+  ],
+  "totals": { "projects": 6, "minutes": 3392.97, "prompts": 4588, "sessions": 64 }
+}
+```
+
+All instants are **UTC-based epoch seconds** (`new Date(sec * 1000)` in JS), so
+the consumer picks the display timezone. The `schema` field is the version
+contract — bump it if the shape ever changes so tools can guard on it.
 
 ## License
 
