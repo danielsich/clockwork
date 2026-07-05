@@ -10,7 +10,10 @@ Usage:
   clockwork <provider> export [idle-min] [options]          Bundle all projects as JSON
   clockwork <provider> list [options]                       List project folders
 
-  <provider> is one of: claude | codex
+  <provider> is one of: claude | codex | both
+
+  both merges Claude and Codex activity per project, so every command above
+  works across both tools at once.
 
   today / week use your local day boundaries and aggregate every project into
   one summary — the "how much have I done" daily check-in. export writes a
@@ -31,6 +34,8 @@ Examples:
   clockwork codex all --json
   clockwork claude today
   clockwork codex week --json
+  clockwork both all
+  clockwork both today
   clockwork claude export > clockwork.json
   clockwork codex export --detail sessions --anonymize > share.json
   clockwork claude all --since 7d
@@ -371,6 +376,38 @@ def codex_list():
 
 
 # --------------------------------------------------------------------------- #
+# Combined backend  (claude + codex merged per project)
+# --------------------------------------------------------------------------- #
+
+def _merge_projects(*project_lists):
+    """Merge [(label, timestamps)] lists, combining same-label projects."""
+    groups = defaultdict(list)
+    for projects in project_lists:
+        for label, ts in projects:
+            groups[label].extend(ts)
+    return [(label, sorted(ts)) for label, ts in groups.items()]
+
+
+def both_single(project_path):
+    _, c_count, c_ts = claude_single(project_path)
+    _, x_count, x_ts = codex_single(project_path)
+    count = c_count + x_count
+    if count == 0:
+        return None, 0, []
+    return project_path, count, sorted(c_ts + x_ts)
+
+
+def both_all():
+    return _merge_projects(claude_all(), codex_all())
+
+
+def both_list():
+    labels = {_claude_folder_to_pretty(f) for f in _claude_list_folders()}
+    labels.update(codex_list())
+    return sorted(labels)
+
+
+# --------------------------------------------------------------------------- #
 # Provider dispatch
 # --------------------------------------------------------------------------- #
 
@@ -387,7 +424,18 @@ PROVIDERS = {
         "list": codex_list,
         "location": "$CODEX_HOME/sessions/",
     },
+    "both": {
+        "single": both_single,
+        "all": both_all,
+        "list": both_list,
+        "location": "claude + codex",
+    },
 }
+
+
+def _provider_label(provider):
+    """Human display name for headers ('both' reads better spelled out)."""
+    return "CLAUDE + CODEX" if provider == "both" else provider.upper()
 
 
 # --------------------------------------------------------------------------- #
@@ -463,7 +511,7 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
     print(f"✅ Found {count} session file(s) for: {label}\n")
 
     print("=" * 52)
-    print(f"  CLOCKWORK — {provider.upper()} SESSION ANALYSIS")
+    print(f"  CLOCKWORK — {_provider_label(provider)} SESSION ANALYSIS")
     print("=" * 52)
     print(f"  Project : {project_path}")
     print(f"  First   : {first_ts.strftime('%Y-%m-%d %H:%M')}")
@@ -552,7 +600,7 @@ def analyze_all(provider, idle_threshold, since, until, as_json):
     max_mins = max(r["minutes"] for r in rows)
 
     print("=" * 78)
-    print(f"  CLOCKWORK — ALL {provider.upper()} PROJECTS  (idle threshold: {idle_threshold} min)")
+    print(f"  CLOCKWORK — ALL {_provider_label(provider)} PROJECTS  (idle threshold: {idle_threshold} min)")
     print("=" * 78)
     print(f"  Projects: {len(rows)} with activity")
     print(f"  Prompts : {grand_prompts} total")
@@ -653,7 +701,7 @@ def analyze_summary(provider, period, idle_threshold, as_json):
 
     width = 60
     print("=" * width)
-    print(f"  CLOCKWORK — {provider.upper()} · {title}")
+    print(f"  CLOCKWORK — {_provider_label(provider)} · {title}")
     print("=" * width)
     if not rows:
         print("  No activity yet. Time to write a prompt.")
@@ -839,7 +887,7 @@ def main():
 
     provider = positionals[0].lower()
     if provider not in PROVIDERS:
-        print(f"Unknown provider: {positionals[0]!r} (expected 'claude' or 'codex')\n")
+        print(f"Unknown provider: {positionals[0]!r} (expected 'claude', 'codex', or 'both')\n")
         print(__doc__.strip())
         sys.exit(1)
 
