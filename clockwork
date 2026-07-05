@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""
+clockwork — analyze Claude Code / Codex session activity.
+
+Usage:
+  clockwork <provider> <project-path> [idle-min]   Analyze one project
+  clockwork <provider> all [idle-min]              Rank all projects
+  clockwork <provider> list                        List project folders
+
+  <provider> is one of: claude | codex
+
+Examples:
+  clockwork claude ~/code/myproject
+  clockwork codex ~/code/myproject 45
+  clockwork codex all
+  clockwork claude list
+
+Data sources:
+  claude → ~/.claude/projects/<encoded-path>/*.jsonl
+  codex  → $CODEX_HOME/sessions/**/rollout-*.jsonl   (default ~/.codex/sessions)
+"""
+
+import sys
+import json
+import os
+import glob
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+
+CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
+
+
+# --------------------------------------------------------------------------- #
+# Shared timing logic
+# --------------------------------------------------------------------------- #
+
+def compute_active_hours(timestamps, idle_threshold_minutes=30):
+    """Group prompt timestamps into sessions and per-day active minutes.
+
+    A gap larger than the idle threshold starts a new session. Session
+    duration is split across calendar-day boundaries so a session crossing
+    midnight is credited to each day it actually spans.
+    """
+    if not timestamps:
+        return {}, []
+
+    sessions = []
+    session_start = timestamps[0]
+    session_end = timestamps[0]
+    threshold = timedelta(minutes=idle_threshold_minutes)
+
+    for ts in timestamps[1:]:
+        if ts - session_end > threshold:
+            sessions.append((session_start, session_end))
+            session_start = ts
+        session_end = ts
+    sessions.append((session_start, session_end))
+
+    daily = defaultdict(float)
+    for start, end in sessions:
+        _add_session_to_daily(daily, start, end)
+
+    return daily, sessions
+
+
+def _add_session_to_daily(daily, start, end):
+    """Distribute a session's minutes across the calendar days it spans."""
+    total_min = (end - start).total_seconds() / 60
+    if total_min < 1:
+        # Zero-length (or sub-minute) session: floor at 1 minute on its day.
+        daily[start.date()] += 1
+        return
+    cursor = start
+    while cursor < end:
+        next_midnight = datetime.combine(
+            cursor.date() + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=cursor.tzinfo,
+        )
+        seg_end = min(end, next_midnight)
+        daily[cursor.date()] += (seg_end - cursor).total_seconds() / 60
+        cursor = seg_end
+
+
+def fmt_duration(minutes):
+    h = int(minutes) // 60
+    m = int(minutes) % 60
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    # Normalize everything to UTC-aware so timestamps from mixed sources
+    # (some tz-aware, some naive) can be safely sorted and subtracted.
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+# --------------------------------------------------------------------------- #
+# Claude backend  (~/.claude/projects/<encoded-path>/*.jsonl)
+# --------------------------------------------------------------------------- #
+
+def path_to_claude_folder(project_path):
+    abs_path = os.path.abspath(os.path.expanduser(project_path))
+    folder_name = abs_path.replace("/", "-").replace("\\", "-")
+    if folder_name.startswith("-"):
+        folder_name = folder_name[1:]
+    return folder_name
+
+
+def _claude_resolve_files(project_path):
+    """Return (folder_name, [files]) for a project path, or (None, [])."""
+    folder = path_to_claude_folder(project_path)
+    # Claude Code retains the leading dash from the absolute path, so try both
+    # the dash-prefixed and stripped forms to match whichever convention exists.
+    for candidate in ("-" + folder, folder):
+        files = glob.glob(os.path.join(CLAUDE_DIR, candidate, "*.jsonl"))
+        if files:
+            return candidate, files
+    return None, []
+
+
+def _claude_timestamps_from_files(files):
+    """Parse user/human turn timestamps from Claude .jsonl files."""
+    timestamps = []
+    for f in sorted(files):
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                role = d.get("role") or d.get("type", "")
+                dt = _parse_ts(d.get("timestamp"))
+                if dt and role in ("human", "user"):
+                    timestamps.append(dt)
+    return sorted(timestamps)
+
+
+def _claude_folder_to_pretty(folder):
+    """Best-effort readable path from a Claude folder name (display only)."""
+    return "/" + folder.lstrip("-").replace("-", "/")
+
+
+def claude_single(project_path):
+    folder, files = _claude_resolve_files(project_path)
+    if not files:
+        return None, 0, []
+    return folder, len(files), _claude_timestamps_from_files(files)
+
+
+def claude_all():
+    result = []
+    for folder in _claude_list_folders():
+        files = glob.glob(os.path.join(CLAUDE_DIR, folder, "*.jsonl"))
+        ts = _claude_timestamps_from_files(files)
+        if ts:
+            result.append((_claude_folder_to_pretty(folder), ts))
+    return result
+
+
+def _claude_list_folders():
+    return sorted(os.listdir(CLAUDE_DIR)) if os.path.exists(CLAUDE_DIR) else []
+
+
+def claude_list():
+    return _claude_list_folders()
+
+
+# --------------------------------------------------------------------------- #
+# Codex backend  ($CODEX_HOME/sessions/**/rollout-*.jsonl)
+# --------------------------------------------------------------------------- #
+
+def _codex_files():
+    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    pattern = os.path.join(codex_home, "sessions", "**", "rollout-*.jsonl")
+    return glob.glob(pattern, recursive=True)
+
+
+def _codex_parse_file(path):
+    """Return (cwd, [timestamps]) for one rollout file.
+
+    Uses the canonical `event_msg -> user_message` prompt records; only falls
+    back to `response_item` user-role messages for files that contain no
+    canonical prompt events, to avoid double counting the same input.
+    """
+    cwd = None
+    canonical = []
+    fallback = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = d.get("type")
+                payload = d.get("payload") or {}
+                if t == "session_meta":
+                    cwd = payload.get("cwd")
+                elif t == "event_msg" and payload.get("type") == "user_message":
+                    dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
+                    if dt:
+                        canonical.append(dt)
+                elif (t == "response_item"
+                      and payload.get("type") == "message"
+                      and payload.get("role") == "user"):
+                    dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
+                    if dt:
+                        fallback.append(dt)
+    except OSError:
+        return None, []
+    return cwd, sorted(canonical if canonical else fallback)
+
+
+def codex_single(project_path):
+    abs_path = os.path.abspath(os.path.expanduser(project_path))
+    matched = 0
+    timestamps = []
+    for f in _codex_files():
+        cwd, file_ts = _codex_parse_file(f)
+        if cwd == abs_path:
+            matched += 1
+            timestamps.extend(file_ts)
+    if not matched:
+        return None, 0, []
+    return abs_path, matched, sorted(timestamps)
+
+
+def codex_all():
+    groups = defaultdict(list)
+    for f in _codex_files():
+        cwd, file_ts = _codex_parse_file(f)
+        if cwd and file_ts:
+            groups[cwd].extend(file_ts)
+    return [(cwd, sorted(ts)) for cwd, ts in groups.items()]
+
+
+def _codex_cwd_only(path):
+    """Return just the session's cwd, reading only until the meta record.
+
+    `list` doesn't need prompt timestamps, so avoid parsing the whole file:
+    the `session_meta` record carrying `cwd` is at the top of the rollout.
+    """
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "session_meta":
+                    return (d.get("payload") or {}).get("cwd")
+    except OSError:
+        return None
+    return None
+
+
+def codex_list():
+    cwds = set()
+    for f in _codex_files():
+        cwd = _codex_cwd_only(f)
+        if cwd:
+            cwds.add(cwd)
+    return sorted(cwds)
+
+
+# --------------------------------------------------------------------------- #
+# Provider dispatch
+# --------------------------------------------------------------------------- #
+
+PROVIDERS = {
+    "claude": {
+        "single": claude_single,
+        "all": claude_all,
+        "list": claude_list,
+        "location": "~/.claude/projects/",
+    },
+    "codex": {
+        "single": codex_single,
+        "all": codex_all,
+        "list": codex_list,
+        "location": "$CODEX_HOME/sessions/",
+    },
+}
+
+
+# --------------------------------------------------------------------------- #
+# Output modes
+# --------------------------------------------------------------------------- #
+
+def analyze_single(provider, project_path, idle_threshold):
+    label, count, timestamps = PROVIDERS[provider]["single"](project_path)
+
+    if count == 0:
+        print(f"❌ No {provider} sessions found for: {project_path}")
+        projects = PROVIDERS[provider]["list"]()
+        if projects:
+            print(f"\n📁 Available {provider} projects ({PROVIDERS[provider]['location']}):")
+            for p in projects:
+                print(f"   {p}")
+        sys.exit(1)
+
+    if not timestamps:
+        print("No user prompts found in session files.")
+        sys.exit(0)
+
+    print(f"✅ Found {count} session file(s) for: {label}\n")
+
+    daily, sessions = compute_active_hours(timestamps, idle_threshold)
+
+    total_minutes = sum(daily.values())
+    first_ts = timestamps[0]
+    last_ts = timestamps[-1]
+    span_days = (last_ts.date() - first_ts.date()).days + 1
+
+    print("=" * 52)
+    print(f"  CLOCKWORK — {provider.upper()} SESSION ANALYSIS")
+    print("=" * 52)
+    print(f"  Project : {project_path}")
+    print(f"  First   : {first_ts.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Last    : {last_ts.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Span    : {span_days} calendar days")
+    print(f"  Prompts : {len(timestamps)} total")
+    print(f"  Sessions: {len(sessions)} (idle threshold: {idle_threshold} min)")
+    print(f"  Active  : {len(daily)} days")
+    print(f"  Total   : {fmt_duration(total_minutes)}")
+    print("=" * 52)
+
+    print(f"\n{'DATE':<14} {'ACTIVE TIME':<14} {'PROMPTS':<10} BAR")
+    print("-" * 52)
+
+    max_mins = max(daily.values())
+    prompts_per_day = defaultdict(int)
+    for ts in timestamps:
+        prompts_per_day[ts.date()] += 1
+
+    for day in sorted(daily):
+        mins = daily[day]
+        bar_len = int((mins / max_mins) * 20) if max_mins else 0
+        bar = "█" * bar_len
+        print(f"  {str(day):<12} {fmt_duration(mins):<14} {prompts_per_day[day]:<10} {bar}")
+
+    print("-" * 52)
+    print(f"  {'TOTAL':<12} {fmt_duration(total_minutes):<14} {len(timestamps)}")
+    print()
+
+
+def analyze_all(provider, idle_threshold):
+    projects = PROVIDERS[provider]["all"]()
+    if not projects:
+        print(f"❌ No {provider} projects with activity found ({PROVIDERS[provider]['location']})")
+        sys.exit(1)
+
+    rows = []
+    grand_minutes = 0.0
+    grand_prompts = 0
+    grand_sessions = 0
+
+    for label, timestamps in projects:
+        daily, sessions = compute_active_hours(timestamps, idle_threshold)
+        total_minutes = sum(daily.values())
+        rows.append({
+            "label": label,
+            "minutes": total_minutes,
+            "prompts": len(timestamps),
+            "sessions": len(sessions),
+        })
+        grand_minutes += total_minutes
+        grand_prompts += len(timestamps)
+        grand_sessions += len(sessions)
+
+    rows.sort(key=lambda r: r["minutes"], reverse=True)
+    max_mins = max(r["minutes"] for r in rows)
+
+    print("=" * 78)
+    print(f"  CLOCKWORK — ALL {provider.upper()} PROJECTS  (idle threshold: {idle_threshold} min)")
+    print("=" * 78)
+    print(f"  Projects: {len(rows)} with activity")
+    print(f"  Prompts : {grand_prompts} total")
+    print(f"  Sessions: {grand_sessions} total")
+    print(f"  Total   : {fmt_duration(grand_minutes)}")
+    print("=" * 78)
+    print()
+    print(f"  {'PROJECT':<40} {'TIME':>9} {'PROMPTS':>8} {'SESS':>5}  BAR")
+    print("-" * 78)
+
+    for r in rows:
+        name = r["label"]
+        if len(name) > 39:
+            name = "…" + name[-38:]
+        bar_len = int((r["minutes"] / max_mins) * 12) if max_mins else 0
+        bar = "█" * bar_len
+        print(f"  {name:<40} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} {r['sessions']:>5}  {bar}")
+
+    print("-" * 78)
+    print(f"  {'TOTAL':<40} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} {grand_sessions:>5}")
+    print()
+
+
+def list_projects(provider):
+    projects = PROVIDERS[provider]["list"]()
+    if not projects:
+        print(f"❌ No {provider} projects found ({PROVIDERS[provider]['location']})")
+        sys.exit(1)
+    print(f"📁 {len(projects)} {provider} project(s) ({PROVIDERS[provider]['location']}):\n")
+    for p in projects:
+        print(f"   {p}")
+    print()
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__.strip())
+        sys.exit(1)
+
+    provider = sys.argv[1].lower()
+    if provider not in PROVIDERS:
+        print(f"Unknown provider: {sys.argv[1]!r} (expected 'claude' or 'codex')\n")
+        print(__doc__.strip())
+        sys.exit(1)
+
+    target = sys.argv[2]
+    idle_threshold = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+
+    if target == "all":
+        analyze_all(provider, idle_threshold)
+    elif target == "list":
+        list_projects(provider)
+    else:
+        analyze_single(provider, target, idle_threshold)
+
+
+if __name__ == "__main__":
+    main()
