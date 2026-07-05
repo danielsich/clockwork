@@ -44,11 +44,19 @@ midnight is credited to each day it spans.
 | -------- | -------- |
 | `claude` | `~/.claude/projects/<encoded-path>/*.jsonl` |
 | `codex`  | `$CODEX_HOME/sessions/**/rollout-*.jsonl` (default `~/.codex/sessions`) |
+| `both`   | merges the two sources per project |
 
 > **Note:** "active time" is a proxy. It measures time *within* sessions, so
 > thinking and response time between prompts counts as active, and a session
 > with a single prompt is floored to one minute. Treat the totals as a
 > reasonable estimate, not a stopwatch.
+
+> **`both` and path matching:** `both` combines Claude and Codex prompts by
+> project path. Single-project mode (`clockwork both ~/dev/x`) is exact,
+> because it encodes the path you pass. In `all` / `export` / `list`, projects
+> are matched by their displayed path — and Claude stores paths dash-encoded,
+> so one containing spaces or dashes can't always be reversed to match Codex's
+> real path. Such a project may appear as two rows rather than merging.
 
 ## Requirements
 
@@ -80,7 +88,7 @@ clockwork <provider> week [idle-min] [options]            Last 7 days, all proje
 clockwork <provider> export [idle-min] [options]          Bundle all projects as JSON
 clockwork <provider> list [options]                       List project folders
 
-  <provider> is one of: claude | codex
+  <provider> is one of: claude | codex | both
 
 Options:
   --json            Emit machine-readable JSON instead of ASCII tables
@@ -100,6 +108,10 @@ clockwork claude ~/dev/myproject
 
 # Same, but treat gaps under 45 min as the same session (Codex)
 clockwork codex ~/dev/myproject 45
+
+# Both tools at once — combined time on one project, or ranked across all
+clockwork both ~/dev/myproject
+clockwork both today
 
 # Rank every project you've worked on, most time first
 clockwork codex all
