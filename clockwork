@@ -5,9 +5,14 @@ clockwork — analyze Claude Code / Codex session activity.
 Usage:
   clockwork <provider> <project-path> [idle-min] [options]  Analyze one project
   clockwork <provider> all [idle-min] [options]             Rank all projects
+  clockwork <provider> today [idle-min] [options]           Today, all projects
+  clockwork <provider> week [idle-min] [options]            Last 7 days, all projects
   clockwork <provider> list [options]                       List project folders
 
   <provider> is one of: claude | codex
+
+  today / week use your local day boundaries and aggregate every project into
+  one summary — the "how much have I done" daily check-in.
 
 Options:
   --json            Emit machine-readable JSON instead of ASCII tables
@@ -20,6 +25,8 @@ Examples:
   clockwork claude ~/code/myproject
   clockwork codex ~/code/myproject 45
   clockwork codex all --json
+  clockwork claude today
+  clockwork codex week --json
   clockwork claude all --since 7d
   clockwork claude ~/code/myproject --since 2026-07-01 --until 2026-07-05
   clockwork claude list
@@ -547,6 +554,119 @@ def analyze_all(provider, idle_threshold, since, until, as_json):
     print()
 
 
+def _period_window(period):
+    """Return (since, until, title) for a named period, in local time.
+
+    `today` spans local midnight to now; `week` is a rolling 7-day window
+    ending today. Boundaries are local-time-aware so "today" means the user's
+    calendar day, not UTC's.
+    """
+    now = datetime.now().astimezone()
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "today":
+        return start_today, now, "TODAY"
+    return start_today - timedelta(days=6), now, "THIS WEEK (last 7 days)"
+
+
+def analyze_summary(provider, period, idle_threshold, as_json):
+    since, until, title = _period_window(period)
+    projects = PROVIDERS[provider]["all"]()
+
+    rows = []
+    combined_daily = defaultdict(float)
+    prompts_per_day = defaultdict(int)
+    grand_minutes = 0.0
+    grand_prompts = 0
+    grand_sessions = 0
+
+    for label, timestamps in projects:
+        timestamps = _filter_timestamps(timestamps, since, until)
+        if not timestamps:
+            continue
+        daily, sessions = compute_active_hours(timestamps, idle_threshold)
+        rows.append({
+            "label": label,
+            "minutes": sum(daily.values()),
+            "prompts": len(timestamps),
+            "sessions": len(sessions),
+        })
+        for day, mins in daily.items():
+            combined_daily[day] += mins
+        for ts in timestamps:
+            prompts_per_day[ts.date()] += 1
+        grand_minutes += sum(daily.values())
+        grand_prompts += len(timestamps)
+        grand_sessions += len(sessions)
+
+    rows.sort(key=lambda r: r["minutes"], reverse=True)
+
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "period": period,
+            "idle_threshold_min": idle_threshold,
+            "since": _iso(since),
+            "until": _iso(until),
+            "projects": [
+                {"project": r["label"],
+                 "minutes": round(r["minutes"], 2),
+                 "prompts": r["prompts"],
+                 "sessions": r["sessions"]}
+                for r in rows
+            ],
+            "days": [
+                {"date": str(day),
+                 "minutes": round(combined_daily[day], 2),
+                 "prompts": prompts_per_day[day]}
+                for day in sorted(combined_daily)
+            ],
+            "totals": {
+                "projects": len(rows),
+                "minutes": round(grand_minutes, 2),
+                "prompts": grand_prompts,
+                "sessions": grand_sessions,
+            },
+        })
+        return
+
+    width = 60
+    print("=" * width)
+    print(f"  CLOCKWORK — {provider.upper()} · {title}")
+    print("=" * width)
+    if not rows:
+        print("  No activity yet. Time to write a prompt.")
+        print("=" * width)
+        print()
+        return
+    print(f"  Active   : {fmt_duration(grand_minutes)} across {len(rows)} project(s)")
+    print(f"  Prompts  : {grand_prompts}    Sessions: {grand_sessions}")
+    print("=" * width)
+    print()
+
+    print(f"  {'PROJECT':<34} {'TIME':>9} {'PROMPTS':>7}  BAR")
+    print("-" * width)
+    max_mins = max(r["minutes"] for r in rows)
+    for r in rows:
+        name = r["label"]
+        if len(name) > 33:
+            name = "…" + name[-32:]
+        bar = "█" * (int((r["minutes"] / max_mins) * 10) if max_mins else 0)
+        print(f"  {name:<34} {fmt_duration(r['minutes']):>9} {r['prompts']:>7}  {bar}")
+    print("-" * width)
+    print(f"  {'TOTAL':<34} {fmt_duration(grand_minutes):>9} {grand_prompts:>7}")
+
+    if period == "week":
+        print()
+        print(f"  {'DAY':<12} {'TIME':>9} {'PROMPTS':>7}  BAR")
+        print("-" * width)
+        max_day = max(combined_daily.values())
+        for day in sorted(combined_daily):
+            mins = combined_daily[day]
+            bar = "█" * (int((mins / max_day) * 10) if max_day else 0)
+            print(f"  {str(day):<12} {fmt_duration(mins):>9} {prompts_per_day[day]:>7}  {bar}")
+    print()
+
+
 def list_projects(provider, as_json):
     projects = PROVIDERS[provider]["list"]()
     if as_json:
@@ -619,6 +739,8 @@ def main():
 
     if target == "all":
         analyze_all(provider, idle_threshold, since, until, opts["json"])
+    elif target in ("today", "week"):
+        analyze_summary(provider, target, idle_threshold, opts["json"])
     elif target == "list":
         list_projects(provider, opts["json"])
     else:
