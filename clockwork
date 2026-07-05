@@ -7,12 +7,14 @@ Usage:
   clockwork <provider> all [idle-min] [options]             Rank all projects
   clockwork <provider> today [idle-min] [options]           Today, all projects
   clockwork <provider> week [idle-min] [options]            Last 7 days, all projects
+  clockwork <provider> export [idle-min] [options]          Bundle all projects as JSON
   clockwork <provider> list [options]                       List project folders
 
   <provider> is one of: claude | codex
 
   today / week use your local day boundaries and aggregate every project into
-  one summary — the "how much have I done" daily check-in.
+  one summary — the "how much have I done" daily check-in. export writes a
+  single self-describing JSON bundle for uploading to external tools.
 
 Options:
   --json            Emit machine-readable JSON instead of ASCII tables
@@ -20,6 +22,8 @@ Options:
   --until <when>    Only count prompts on/before this point in time
                     <when> is YYYY-MM-DD, an ISO timestamp, or a relative
                     form like 7d (7 days ago) or 2w (2 weeks ago)
+  --detail <level>  export granularity: raw | sessions | daily (default raw)
+  --anonymize       export: replace project paths with a hash id + generic name
 
 Examples:
   clockwork claude ~/code/myproject
@@ -27,6 +31,8 @@ Examples:
   clockwork codex all --json
   clockwork claude today
   clockwork codex week --json
+  clockwork claude export > clockwork.json
+  clockwork codex export --detail sessions --anonymize > share.json
   clockwork claude all --since 7d
   clockwork claude ~/code/myproject --since 2026-07-01 --until 2026-07-05
   clockwork claude list
@@ -41,6 +47,7 @@ import json
 import os
 import re
 import glob
+import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -51,33 +58,39 @@ CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
 # Shared timing logic
 # --------------------------------------------------------------------------- #
 
-def compute_active_hours(timestamps, idle_threshold_minutes=30):
-    """Group prompt timestamps into sessions and per-day active minutes.
+def group_sessions(timestamps, idle_threshold_minutes=30):
+    """Group sorted prompt timestamps into (start, end, prompt_count) sessions.
 
-    A gap larger than the idle threshold starts a new session. Session
-    duration is split across calendar-day boundaries so a session crossing
-    midnight is credited to each day it actually spans.
+    A gap larger than the idle threshold starts a new session.
     """
     if not timestamps:
-        return {}, []
-
-    sessions = []
-    session_start = timestamps[0]
-    session_end = timestamps[0]
+        return []
     threshold = timedelta(minutes=idle_threshold_minutes)
-
+    sessions = []
+    start = end = timestamps[0]
+    count = 1
     for ts in timestamps[1:]:
-        if ts - session_end > threshold:
-            sessions.append((session_start, session_end))
-            session_start = ts
-        session_end = ts
-    sessions.append((session_start, session_end))
+        if ts - end > threshold:
+            sessions.append((start, end, count))
+            start = ts
+            count = 0
+        end = ts
+        count += 1
+    sessions.append((start, end, count))
+    return sessions
 
+
+def compute_active_hours(timestamps, idle_threshold_minutes=30):
+    """Return (per-day active minutes, [(start, end), ...] sessions).
+
+    Session duration is split across calendar-day boundaries so a session
+    crossing midnight is credited to each day it actually spans.
+    """
+    sessions = group_sessions(timestamps, idle_threshold_minutes)
     daily = defaultdict(float)
-    for start, end in sessions:
+    for start, end, _ in sessions:
         _add_session_to_daily(daily, start, end)
-
-    return daily, sessions
+    return daily, [(start, end) for start, end, _ in sessions]
 
 
 def _add_session_to_daily(daily, start, end):
@@ -168,6 +181,15 @@ def _iso(dt):
 
 def _print_json(obj):
     print(json.dumps(obj, indent=2))
+
+
+def _project_id(path):
+    """Stable short id for a project path (survives anonymization)."""
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
+
+
+def _display_name(path):
+    return os.path.basename(path.rstrip("/")) or path
 
 
 # --------------------------------------------------------------------------- #
@@ -667,6 +689,94 @@ def analyze_summary(provider, period, idle_threshold, as_json):
     print()
 
 
+def export_data(provider, idle_threshold, since, until, detail, anonymize):
+    """Emit one versioned JSON bundle of every project for external tools.
+
+    Always writes JSON to stdout. `detail` selects granularity:
+      daily    → per-day minutes/prompts only (smallest, least revealing)
+      sessions → adds grouped sessions with start/end + prompt counts
+      raw      → adds every prompt's epoch-second timestamp (fully re-analyzable)
+
+    Higher levels are supersets: a `raw` export still carries the daily and
+    session aggregates so a consumer can start simple and drill down.
+    Timestamps are UTC-based epoch seconds; the `daily` buckets use UTC dates.
+    """
+    projects = PROVIDERS[provider]["all"]()
+
+    out_projects = []
+    grand_minutes = 0.0
+    grand_prompts = 0
+    grand_sessions = 0
+
+    for i, (label, timestamps) in enumerate(
+            sorted(projects, key=lambda p: p[0]), start=1):
+        timestamps = _filter_timestamps(timestamps, since, until)
+        if not timestamps:
+            continue
+        daily, _ = compute_active_hours(timestamps, idle_threshold)
+        sessions = group_sessions(timestamps, idle_threshold)
+        total_minutes = sum(daily.values())
+
+        prompts_per_day = defaultdict(int)
+        for ts in timestamps:
+            prompts_per_day[ts.date()] += 1
+
+        proj = {
+            "id": _project_id(label),
+            "name": f"project-{i}" if anonymize else _display_name(label),
+            "totals": {
+                "minutes": round(total_minutes, 2),
+                "prompts": len(timestamps),
+                "sessions": len(sessions),
+                "active_days": len(daily),
+                "first": int(timestamps[0].timestamp()),
+                "last": int(timestamps[-1].timestamp()),
+            },
+            "daily": [
+                {"date": str(day),
+                 "minutes": round(daily[day], 2),
+                 "prompts": prompts_per_day[day]}
+                for day in sorted(daily)
+            ],
+        }
+        if not anonymize:
+            proj["path"] = label
+        if detail in ("sessions", "raw"):
+            proj["sessions"] = [
+                {"start": int(s.timestamp()),
+                 "end": int(e.timestamp()),
+                 "minutes": round((e - s).total_seconds() / 60, 2),
+                 "prompts": c}
+                for s, e, c in sessions
+            ]
+        if detail == "raw":
+            proj["prompts"] = [int(ts.timestamp()) for ts in timestamps]
+
+        out_projects.append(proj)
+        grand_minutes += total_minutes
+        grand_prompts += len(timestamps)
+        grand_sessions += len(sessions)
+
+    _print_json({
+        "schema": "clockwork/v1",
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "provider": provider,
+        "idle_threshold_min": idle_threshold,
+        "detail": detail,
+        "anonymized": anonymize,
+        "daily_tz": "UTC",
+        "since": _iso(since),
+        "until": _iso(until),
+        "projects": out_projects,
+        "totals": {
+            "projects": len(out_projects),
+            "minutes": round(grand_minutes, 2),
+            "prompts": grand_prompts,
+            "sessions": grand_sessions,
+        },
+    })
+
+
 def list_projects(provider, as_json):
     projects = PROVIDERS[provider]["list"]()
     if as_json:
@@ -692,14 +802,17 @@ def _die(msg):
 
 def _parse_args(argv):
     """Split flags from positionals. Returns (positionals, opts)."""
-    opts = {"json": False, "since": None, "until": None}
+    opts = {"json": False, "since": None, "until": None,
+            "detail": "raw", "anonymize": False}
     positionals = []
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--json":
             opts["json"] = True
-        elif a in ("--since", "--until"):
+        elif a == "--anonymize":
+            opts["anonymize"] = True
+        elif a in ("--since", "--until", "--detail"):
             i += 1
             if i >= len(argv):
                 _die(f"{a} requires a value")
@@ -708,6 +821,8 @@ def _parse_args(argv):
             opts["since"] = a.split("=", 1)[1]
         elif a.startswith("--until="):
             opts["until"] = a.split("=", 1)[1]
+        elif a.startswith("--detail="):
+            opts["detail"] = a.split("=", 1)[1]
         elif a.startswith("--"):
             _die(f"unknown option: {a}")
         else:
@@ -731,6 +846,9 @@ def main():
     target = positionals[1]
     idle_threshold = int(positionals[2]) if len(positionals) > 2 else 30
 
+    if opts["detail"] not in ("raw", "sessions", "daily"):
+        _die(f"--detail must be raw, sessions, or daily (got {opts['detail']!r})")
+
     try:
         since = _parse_date_bound(opts["since"])
         until = _parse_date_bound(opts["until"], end_of_day=True)
@@ -741,6 +859,9 @@ def main():
         analyze_all(provider, idle_threshold, since, until, opts["json"])
     elif target in ("today", "week"):
         analyze_summary(provider, target, idle_threshold, opts["json"])
+    elif target == "export":
+        export_data(provider, idle_threshold, since, until,
+                    opts["detail"], opts["anonymize"])
     elif target == "list":
         list_projects(provider, opts["json"])
     else:
