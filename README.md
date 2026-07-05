@@ -75,6 +75,8 @@ ln -s "$PWD/clockwork" ~/.local/bin/clockwork
 ```
 clockwork <provider> <project-path> [idle-min] [options]  Analyze one project
 clockwork <provider> all [idle-min] [options]             Rank all projects
+clockwork <provider> today [idle-min] [options]           Today, all projects
+clockwork <provider> week [idle-min] [options]            Last 7 days, all projects
 clockwork <provider> list [options]                       List project folders
 
   <provider> is one of: claude | codex
@@ -102,6 +104,12 @@ clockwork codex all
 # List the projects clockwork can see
 clockwork claude list
 
+# Daily check-in: everything you did today, across all projects
+clockwork claude today
+
+# Your week at a glance (per-project + a day-by-day breakdown)
+clockwork codex week
+
 # Only the last 7 days, across all projects
 clockwork claude all --since 7d
 
@@ -115,6 +123,15 @@ clockwork codex all --json | jq '.projects[] | {project, minutes}'
 The optional trailing number overrides the idle threshold in minutes
 (default `30`). A larger threshold merges short breaks into one session; a
 smaller one splits work into more, shorter sessions.
+
+### Daily & weekly summaries
+
+`today` and `week` aggregate **every** project into a single check-in instead
+of analyzing one at a time. `today` covers local midnight to now; `week` is a
+rolling 7-day window ending today. Both show a per-project breakdown, and
+`week` adds a day-by-day view so you can see your week at a glance. Day
+boundaries are **local time**, so "today" means your calendar day, not UTC's.
+They honor the optional `idle-min` and pair with `--json`.
 
 ### Filtering by date
 
