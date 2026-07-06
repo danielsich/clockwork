@@ -55,7 +55,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def _resolve_claude_dir():
@@ -894,7 +894,11 @@ def _parse_args(argv):
 
 
 def main():
-    positionals, opts = _parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        sys.exit(0)
+    positionals, opts = _parse_args(argv)
     if len(positionals) < 2:
         print(__doc__.strip())
         sys.exit(1)
