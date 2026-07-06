@@ -60,11 +60,19 @@ midnight is credited to each day it spans.
 
 ## Requirements
 
-- Python 3.7+ (standard library only — no `pip install` needed)
+- Python 3.7+ (standard library only — no dependencies)
 
 ## Install
 
-**macOS / Linux**
+**pip (recommended — works on macOS, Linux, and Windows)**
+
+```bash
+pip install clockwork-cli
+```
+
+This puts `clockwork` on your PATH. Done.
+
+**From source — macOS / Linux**
 
 ```bash
 git clone https://github.com/danielsich/clockwork.git
@@ -78,7 +86,7 @@ ln -s "$PWD/clockwork" ~/.local/bin/clockwork
 ./clockwork claude all
 ```
 
-**Windows**
+**From source — Windows**
 
 ```powershell
 git clone https://github.com/danielsich/clockwork.git
@@ -86,14 +94,10 @@ cd clockwork
 
 # Run directly with Python (the shebang line is ignored on Windows)
 python clockwork claude all
-
-# Or add the directory to your PATH and invoke as:
-python -m clockwork claude all   # not needed — just call the script
 ```
 
-> clockwork looks for Claude logs in `%APPDATA%\Claude\projects` first, then
-> `~\.claude\projects`. One of those will already exist if you have Claude Code
-> installed.
+> On Windows, clockwork looks for Claude logs in `%APPDATA%\Claude\projects`
+> first, then `~\.claude\projects`.
 
 ## Usage
 
