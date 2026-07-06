@@ -199,6 +199,9 @@ one pre-aggregated view), the export is designed to be re-analyzed downstream.
 # Full-fidelity export you can re-analyze anywhere
 clockwork claude export > clockwork.json
 
+# Both tools in one bundle, attributed per provider (see "Provider attribution")
+clockwork both export > clockwork.json
+
 # Smaller / shareable: grouped sessions only, with paths stripped
 clockwork codex export --detail sessions --anonymize > share.json
 
@@ -220,13 +223,31 @@ drops the `path`, renames projects to `project-N`, and keeps only a stable
 hash `id` — so an uploaded file leaks nothing identifying while still letting a
 tool tell projects apart across exports.
 
-### Export schema (`clockwork/v1`)
+### Provider attribution
+
+`clockwork both export` carries **both tools in one bundle** without merging
+them: attribution lives at the project level. Every project entry has a
+`provider`, and if the same path was touched by both Claude and Codex it emits
+**one entry per (path, provider)** — each with its own `totals`, `daily`,
+`sessions`, and `prompts`. A viewer can filter by provider or re-merge by path
+for a combined view, so nothing is lost either way.
+
+- Top-level `provider` is `"both"` when more than one provider contributed,
+  otherwise the single provider name (so a `both` export with only Claude
+  activity still reads `"claude"`).
+- `providers` lists the sorted, distinct providers included (always present,
+  one element for a single-provider export).
+- `totals.by_provider` breaks the grand totals down per provider; the grand
+  `totals` stay the cross-provider sum.
+
+### Export schema (`clockwork/v2`)
 
 ```jsonc
 {
-  "schema": "clockwork/v1",
+  "schema": "clockwork/v2",
   "generated_at": "2026-07-06T00:30:00+02:00",  // local ISO-8601
-  "provider": "claude",
+  "provider": "both",         // "claude" | "codex" | "both"
+  "providers": ["claude", "codex"],  // sorted, distinct; ≥ 1 element
   "idle_threshold_min": 30,
   "detail": "raw",           // raw | sessions | daily
   "anonymized": false,
@@ -235,7 +256,8 @@ tool tell projects apart across exports.
   "until": null,
   "projects": [
     {
-      "id": "0ac6be84",      // stable sha1(path) prefix; survives --anonymize
+      "id": "0ac6be84",      // stable sha1(provider + "\0" + path) prefix; survives --anonymize
+      "provider": "claude",  // the single tool this entry's activity belongs to
       "name": "myproject",   // basename, or "project-N" when anonymized
       "path": "/Users/you/dev/myproject",   // omitted when anonymized
       "totals": {
@@ -249,13 +271,20 @@ tool tell projects apart across exports.
       "prompts":  [ 1780521570, 1780521582 ]               // detail == raw
     }
   ],
-  "totals": { "projects": 6, "minutes": 3392.97, "prompts": 4588, "sessions": 64 }
+  "totals": {
+    "projects": 6, "minutes": 3392.97, "prompts": 4588, "sessions": 64,
+    "by_provider": {
+      "claude": { "projects": 4, "minutes": 2500.0, "prompts": 3000, "sessions": 40 },
+      "codex":  { "projects": 2, "minutes": 892.97, "prompts": 1588, "sessions": 24 }
+    }
+  }
 }
 ```
 
 All instants are **UTC-based epoch seconds** (`new Date(sec * 1000)` in JS), so
 the consumer picks the display timezone. The `schema` field is the version
-contract — bump it if the shape ever changes so tools can guard on it.
+contract — `clockwork/v2` is a breaking bump over `v1` (provider moved to the
+project level), so tools should guard on it.
 
 ## License
 

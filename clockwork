@@ -226,9 +226,14 @@ def _stdout_target():
     return None
 
 
-def _project_id(path):
-    """Stable short id for a project path (survives anonymization)."""
-    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
+def _project_id(provider, path):
+    """Stable short id for a (provider, path) pair (survives anonymization).
+
+    Hashing the provider alongside the path keeps ids distinct when the same
+    project is touched by more than one tool, so a combined export can carry
+    two entries for one path without id collisions.
+    """
+    return hashlib.sha1(f"{provider}\0{path}".encode("utf-8")).hexdigest()[:8]
 
 
 def _display_name(path):
@@ -476,6 +481,15 @@ PROVIDERS = {
 def _provider_label(provider):
     """Human display name for headers ('both' reads better spelled out)."""
     return "CLAUDE + CODEX" if provider == "both" else provider.upper()
+
+
+def _export_providers(provider):
+    """Concrete single-provider backends to walk for an export.
+
+    `both` fans out to each real provider so a project's activity can be
+    attributed per provider; a single provider exports just itself.
+    """
+    return ["claude", "codex"] if provider == "both" else [provider]
 
 
 # --------------------------------------------------------------------------- #
@@ -788,67 +802,102 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
     Higher levels are supersets: a `raw` export still carries the daily and
     session aggregates so a consumer can start simple and drill down.
     Timestamps are UTC-based epoch seconds; the `daily` buckets use UTC dates.
-    """
-    projects = PROVIDERS[provider]["all"]()
 
+    Provider attribution lives at the project level: every entry carries a
+    `provider`, and a `both` export emits one entry per (path, provider) pair
+    so a path touched by both tools appears twice — each with its own totals,
+    daily, sessions, and prompts. Top-level `provider` is "both" when more than
+    one provider contributed; `providers` lists them, and `totals.by_provider`
+    breaks the grand totals down per provider.
+    """
     out_projects = []
+    by_provider = {}
     grand_minutes = 0.0
     grand_prompts = 0
     grand_sessions = 0
+    name_counter = 0
 
-    for i, (label, timestamps) in enumerate(
-            sorted(projects, key=lambda p: p[0]), start=1):
-        timestamps = _filter_timestamps(timestamps, since, until)
-        if not timestamps:
-            continue
-        daily, _ = compute_active_hours(timestamps, idle_threshold)
-        sessions = group_sessions(timestamps, idle_threshold)
-        total_minutes = sum(daily.values())
+    for prov in _export_providers(provider):
+        projects = PROVIDERS[prov]["all"]()
+        p_minutes = 0.0
+        p_prompts = 0
+        p_sessions = 0
+        p_projects = 0
 
-        prompts_per_day = defaultdict(int)
-        for ts in timestamps:
-            prompts_per_day[ts.date()] += 1
+        for label, timestamps in sorted(projects, key=lambda p: p[0]):
+            timestamps = _filter_timestamps(timestamps, since, until)
+            if not timestamps:
+                continue
+            daily, _ = compute_active_hours(timestamps, idle_threshold)
+            sessions = group_sessions(timestamps, idle_threshold)
+            total_minutes = sum(daily.values())
 
-        proj = {
-            "id": _project_id(label),
-            "name": f"project-{i}" if anonymize else _display_name(label),
-            "totals": {
-                "minutes": round(total_minutes, 2),
-                "prompts": len(timestamps),
-                "sessions": len(sessions),
-                "active_days": len(daily),
-                "first": int(timestamps[0].timestamp()),
-                "last": int(timestamps[-1].timestamp()),
-            },
-            "daily": [
-                {"date": str(day),
-                 "minutes": round(daily[day], 2),
-                 "prompts": prompts_per_day[day]}
-                for day in sorted(daily)
-            ],
-        }
-        if not anonymize:
-            proj["path"] = label
-        if detail in ("sessions", "raw"):
-            proj["sessions"] = [
-                {"start": int(s.timestamp()),
-                 "end": int(e.timestamp()),
-                 "minutes": round((e - s).total_seconds() / 60, 2),
-                 "prompts": c}
-                for s, e, c in sessions
-            ]
-        if detail == "raw":
-            proj["prompts"] = [int(ts.timestamp()) for ts in timestamps]
+            prompts_per_day = defaultdict(int)
+            for ts in timestamps:
+                prompts_per_day[ts.date()] += 1
 
-        out_projects.append(proj)
-        grand_minutes += total_minutes
-        grand_prompts += len(timestamps)
-        grand_sessions += len(sessions)
+            name_counter += 1
+            proj = {
+                "id": _project_id(prov, label),
+                "provider": prov,
+                "name": f"project-{name_counter}" if anonymize else _display_name(label),
+                "totals": {
+                    "minutes": round(total_minutes, 2),
+                    "prompts": len(timestamps),
+                    "sessions": len(sessions),
+                    "active_days": len(daily),
+                    "first": int(timestamps[0].timestamp()),
+                    "last": int(timestamps[-1].timestamp()),
+                },
+                "daily": [
+                    {"date": str(day),
+                     "minutes": round(daily[day], 2),
+                     "prompts": prompts_per_day[day]}
+                    for day in sorted(daily)
+                ],
+            }
+            if not anonymize:
+                proj["path"] = label
+            if detail in ("sessions", "raw"):
+                proj["sessions"] = [
+                    {"start": int(s.timestamp()),
+                     "end": int(e.timestamp()),
+                     "minutes": round((e - s).total_seconds() / 60, 2),
+                     "prompts": c}
+                    for s, e, c in sessions
+                ]
+            if detail == "raw":
+                proj["prompts"] = [int(ts.timestamp()) for ts in timestamps]
+
+            out_projects.append(proj)
+            p_projects += 1
+            p_minutes += total_minutes
+            p_prompts += len(timestamps)
+            p_sessions += len(sessions)
+
+        if p_projects:
+            by_provider[prov] = {
+                "projects": p_projects,
+                "minutes": round(p_minutes, 2),
+                "prompts": p_prompts,
+                "sessions": p_sessions,
+            }
+            grand_minutes += p_minutes
+            grand_prompts += p_prompts
+            grand_sessions += p_sessions
+
+    # Report the providers that actually contributed activity; fall back to the
+    # requested set so a single-provider export is never emitted with an empty
+    # `providers` list even when nothing matched the filters.
+    present = sorted(by_provider)
+    providers = present if present else sorted(_export_providers(provider))
+    provider_field = "both" if len(providers) > 1 else providers[0]
 
     _print_json({
-        "schema": "clockwork/v1",
+        "schema": "clockwork/v2",
         "generated_at": datetime.now().astimezone().isoformat(),
-        "provider": provider,
+        "provider": provider_field,
+        "providers": providers,
         "idle_threshold_min": idle_threshold,
         "detail": detail,
         "anonymized": anonymize,
@@ -861,13 +910,14 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
             "minutes": round(grand_minutes, 2),
             "prompts": grand_prompts,
             "sessions": grand_sessions,
+            "by_provider": by_provider,
         },
     })
 
     # A friendly receipt on stderr — keeps stdout pure JSON for redirection.
     dest = _stdout_target()
     where = dest if dest else "stdout"
-    tags = [provider, f"detail={detail}"]
+    tags = [provider_field, f"detail={detail}"]
     if anonymize:
         tags.append("anonymized")
     print(f"\n  ✓ export complete → {where}", file=sys.stderr)
