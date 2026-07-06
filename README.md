@@ -1,5 +1,8 @@
 # clockwork
 
+[![PyPI](https://img.shields.io/pypi/v/clockwork-cli)](https://pypi.org/project/clockwork-cli/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
 A tiny, dependency-free CLI that mines your **Claude Code** and **Codex**
 session logs to estimate how much *active* time you've actually spent — per
 project, per day — and renders it as ASCII bar charts in your terminal.
