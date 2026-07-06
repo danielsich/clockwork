@@ -55,7 +55,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 def _resolve_claude_dir():
@@ -198,6 +198,34 @@ def _iso(dt):
 
 def _print_json(obj):
     print(json.dumps(obj, indent=2))
+
+
+def _stdout_target():
+    """Best-effort name of where stdout is going, for status messages.
+
+    Returns the basename of the file when stdout is redirected to a regular
+    file (`> out.json`), or None for a terminal or a pipe. Purely cosmetic;
+    any failure degrades to None so it never affects the export itself.
+    """
+    try:
+        if os.isatty(1):
+            return None
+    except Exception:
+        return None
+    path = None
+    try:  # macOS / BSD: ask the kernel for fd 1's path
+        import fcntl
+        f_getpath = getattr(fcntl, "F_GETPATH", 50)
+        raw = fcntl.fcntl(1, f_getpath, b"\0" * 1024)
+        path = raw.split(b"\0", 1)[0].decode() or None
+    except Exception:
+        try:  # Linux: /proc symlink
+            path = os.readlink("/proc/self/fd/1")
+        except Exception:
+            path = None
+    if path and os.path.isfile(path):
+        return os.path.basename(path)
+    return None
 
 
 def _project_id(path):
@@ -837,6 +865,18 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
             "sessions": grand_sessions,
         },
     })
+
+    # A friendly receipt on stderr — keeps stdout pure JSON for redirection.
+    dest = _stdout_target()
+    where = dest if dest else "stdout"
+    tags = [provider, f"detail={detail}"]
+    if anonymize:
+        tags.append("anonymized")
+    print(f"\n  ✓ export complete → {where}", file=sys.stderr)
+    print(f"    {' · '.join(tags)}", file=sys.stderr)
+    print(f"    {len(out_projects)} projects · {grand_prompts:,} prompts "
+          f"· {grand_sessions:,} sessions · {grand_minutes / 60:.1f}h active",
+          file=sys.stderr)
 
 
 def list_projects(provider, as_json):
