@@ -42,7 +42,7 @@ midnight is credited to each day it spans.
 
 | Provider | Location |
 | -------- | -------- |
-| `claude` | `~/.claude/projects/<encoded-path>/*.jsonl` |
+| `claude` | `~/.claude/projects/<encoded-path>/*.jsonl` (macOS/Linux)<br>`%APPDATA%\Claude\projects\<encoded-path>\*.jsonl` (Windows) |
 | `codex`  | `$CODEX_HOME/sessions/**/rollout-*.jsonl` (default `~/.codex/sessions`) |
 | `both`   | merges the two sources per project |
 
@@ -64,7 +64,7 @@ midnight is credited to each day it spans.
 
 ## Install
 
-Clone the repo and put the script on your `PATH`:
+**macOS / Linux**
 
 ```bash
 git clone https://github.com/danielsich/clockwork.git
@@ -77,6 +77,23 @@ ln -s "$PWD/clockwork" ~/.local/bin/clockwork
 # option B: just run it directly
 ./clockwork claude all
 ```
+
+**Windows**
+
+```powershell
+git clone https://github.com/danielsich/clockwork.git
+cd clockwork
+
+# Run directly with Python (the shebang line is ignored on Windows)
+python clockwork claude all
+
+# Or add the directory to your PATH and invoke as:
+python -m clockwork claude all   # not needed — just call the script
+```
+
+> clockwork looks for Claude logs in `%APPDATA%\Claude\projects` first, then
+> `~\.claude\projects`. One of those will already exist if you have Claude Code
+> installed.
 
 ## Usage
 

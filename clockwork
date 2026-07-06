@@ -56,7 +56,17 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
+def _resolve_claude_dir():
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidate = os.path.join(appdata, "Claude", "projects")
+            if os.path.isdir(candidate):
+                return candidate
+        return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    return os.path.expanduser("~/.claude/projects")
+
+CLAUDE_DIR = _resolve_claude_dir()
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +204,7 @@ def _project_id(path):
 
 
 def _display_name(path):
-    return os.path.basename(path.rstrip("/")) or path
+    return os.path.basename(path.rstrip("/\\")) or path
 
 
 # --------------------------------------------------------------------------- #
@@ -203,7 +213,7 @@ def _display_name(path):
 
 def path_to_claude_folder(project_path):
     abs_path = os.path.abspath(os.path.expanduser(project_path))
-    folder_name = abs_path.replace("/", "-").replace("\\", "-")
+    folder_name = abs_path.replace("/", "-").replace("\\", "-").replace(":", "-")
     if folder_name.startswith("-"):
         folder_name = folder_name[1:]
     return folder_name
@@ -243,6 +253,8 @@ def _claude_timestamps_from_files(files):
 
 def _claude_folder_to_pretty(folder):
     """Best-effort readable path from a Claude folder name (display only)."""
+    if sys.platform == "win32":
+        return folder
     return "/" + folder.lstrip("-").replace("-", "/")
 
 
