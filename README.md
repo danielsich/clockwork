@@ -2,6 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/clockwork-cli)](https://pypi.org/project/clockwork-cli/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/danielsich/clockwork)
 
 A tiny, dependency-free CLI that mines your **Claude Code** and **Codex**
 session logs to estimate how much *active* time you've actually spent — per
