@@ -1,0 +1,930 @@
+"""
+clockwork — analyze Claude Code / Codex session activity.
+
+Usage:
+  clockwork <provider> <project-path> [idle-min] [options]  Analyze one project
+  clockwork <provider> all [idle-min] [options]             Rank all projects
+  clockwork <provider> today [idle-min] [options]           Today, all projects
+  clockwork <provider> week [idle-min] [options]            Last 7 days, all projects
+  clockwork <provider> export [idle-min] [options]          Bundle all projects as JSON
+  clockwork <provider> list [options]                       List project folders
+
+  <provider> is one of: claude | codex | both
+
+  both merges Claude and Codex activity per project, so every command above
+  works across both tools at once.
+
+  today / week use your local day boundaries and aggregate every project into
+  one summary — the "how much have I done" daily check-in. export writes a
+  single self-describing JSON bundle for uploading to external tools.
+
+Options:
+  --json            Emit machine-readable JSON instead of ASCII tables
+  --since <when>    Only count prompts on/after this point in time
+  --until <when>    Only count prompts on/before this point in time
+                    <when> is YYYY-MM-DD, an ISO timestamp, or a relative
+                    form like 7d (7 days ago) or 2w (2 weeks ago)
+  --detail <level>  export granularity: raw | sessions | daily (default raw)
+  --anonymize       export: replace project paths with a hash id + generic name
+
+Examples:
+  clockwork claude ~/code/myproject
+  clockwork codex ~/code/myproject 45
+  clockwork codex all --json
+  clockwork claude today
+  clockwork codex week --json
+  clockwork both all
+  clockwork both today
+  clockwork claude export > clockwork.json
+  clockwork codex export --detail sessions --anonymize > share.json
+  clockwork claude all --since 7d
+  clockwork claude ~/code/myproject --since 2026-07-01 --until 2026-07-05
+  clockwork claude list
+
+Data sources:
+  claude → ~/.claude/projects/<encoded-path>/*.jsonl
+  codex  → $CODEX_HOME/sessions/**/rollout-*.jsonl   (default ~/.codex/sessions)
+"""
+
+import sys
+import json
+import os
+import re
+import glob
+import hashlib
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+
+__version__ = "0.1.0"
+
+
+def _resolve_claude_dir():
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidate = os.path.join(appdata, "Claude", "projects")
+            if os.path.isdir(candidate):
+                return candidate
+        return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    return os.path.expanduser("~/.claude/projects")
+
+CLAUDE_DIR = _resolve_claude_dir()
+
+
+# --------------------------------------------------------------------------- #
+# Shared timing logic
+# --------------------------------------------------------------------------- #
+
+def group_sessions(timestamps, idle_threshold_minutes=30):
+    """Group sorted prompt timestamps into (start, end, prompt_count) sessions.
+
+    A gap larger than the idle threshold starts a new session.
+    """
+    if not timestamps:
+        return []
+    threshold = timedelta(minutes=idle_threshold_minutes)
+    sessions = []
+    start = end = timestamps[0]
+    count = 1
+    for ts in timestamps[1:]:
+        if ts - end > threshold:
+            sessions.append((start, end, count))
+            start = ts
+            count = 0
+        end = ts
+        count += 1
+    sessions.append((start, end, count))
+    return sessions
+
+
+def compute_active_hours(timestamps, idle_threshold_minutes=30):
+    """Return (per-day active minutes, [(start, end), ...] sessions).
+
+    Session duration is split across calendar-day boundaries so a session
+    crossing midnight is credited to each day it actually spans.
+    """
+    sessions = group_sessions(timestamps, idle_threshold_minutes)
+    daily = defaultdict(float)
+    for start, end, _ in sessions:
+        _add_session_to_daily(daily, start, end)
+    return daily, [(start, end) for start, end, _ in sessions]
+
+
+def _add_session_to_daily(daily, start, end):
+    """Distribute a session's minutes across the calendar days it spans."""
+    total_min = (end - start).total_seconds() / 60
+    if total_min < 1:
+        # Zero-length (or sub-minute) session: floor at 1 minute on its day.
+        daily[start.date()] += 1
+        return
+    cursor = start
+    while cursor < end:
+        next_midnight = datetime.combine(
+            cursor.date() + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=cursor.tzinfo,
+        )
+        seg_end = min(end, next_midnight)
+        daily[cursor.date()] += (seg_end - cursor).total_seconds() / 60
+        cursor = seg_end
+
+
+def fmt_duration(minutes):
+    h = int(minutes) // 60
+    m = int(minutes) % 60
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    # Normalize everything to UTC-aware so timestamps from mixed sources
+    # (some tz-aware, some naive) can be safely sorted and subtracted.
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_date_bound(value, end_of_day=False):
+    """Parse a --since/--until value into a UTC-aware datetime.
+
+    Accepts a relative form (`7d`, `2w`) meaning that many days/weeks before
+    now, a bare ISO date (`YYYY-MM-DD`), or a full ISO timestamp. A bare date
+    used as an upper bound snaps to the end of that day so the day is inclusive.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    m = re.fullmatch(r"(\d+)([dw])", value.lower())
+    if m:
+        n = int(m.group(1))
+        delta = timedelta(weeks=n) if m.group(2) == "w" else timedelta(days=n)
+        return datetime.now(timezone.utc) - delta
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return dt
+    except ValueError:
+        pass
+    dt = _parse_ts(value)
+    if dt is None:
+        raise ValueError(
+            f"unrecognized date {value!r} (use YYYY-MM-DD, an ISO timestamp, "
+            f"or a relative form like 7d / 2w)"
+        )
+    return dt
+
+
+def _filter_timestamps(timestamps, since, until):
+    """Keep only timestamps within [since, until] (either bound may be None)."""
+    if since is None and until is None:
+        return timestamps
+    return [
+        ts for ts in timestamps
+        if (since is None or ts >= since) and (until is None or ts <= until)
+    ]
+
+
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def _print_json(obj):
+    print(json.dumps(obj, indent=2))
+
+
+def _project_id(path):
+    """Stable short id for a project path (survives anonymization)."""
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
+
+
+def _display_name(path):
+    return os.path.basename(path.rstrip("/\\")) or path
+
+
+# --------------------------------------------------------------------------- #
+# Claude backend  (~/.claude/projects/<encoded-path>/*.jsonl)
+# --------------------------------------------------------------------------- #
+
+def path_to_claude_folder(project_path):
+    abs_path = os.path.abspath(os.path.expanduser(project_path))
+    folder_name = abs_path.replace("/", "-").replace("\\", "-").replace(":", "-")
+    if folder_name.startswith("-"):
+        folder_name = folder_name[1:]
+    return folder_name
+
+
+def _claude_resolve_files(project_path):
+    """Return (folder_name, [files]) for a project path, or (None, [])."""
+    folder = path_to_claude_folder(project_path)
+    # Claude Code retains the leading dash from the absolute path, so try both
+    # the dash-prefixed and stripped forms to match whichever convention exists.
+    for candidate in ("-" + folder, folder):
+        files = glob.glob(os.path.join(CLAUDE_DIR, candidate, "*.jsonl"))
+        if files:
+            return candidate, files
+    return None, []
+
+
+def _claude_timestamps_from_files(files):
+    """Parse user/human turn timestamps from Claude .jsonl files."""
+    timestamps = []
+    for f in sorted(files):
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                role = d.get("role") or d.get("type", "")
+                dt = _parse_ts(d.get("timestamp"))
+                if dt and role in ("human", "user"):
+                    timestamps.append(dt)
+    return sorted(timestamps)
+
+
+def _claude_folder_to_pretty(folder):
+    """Best-effort readable path from a Claude folder name (display only)."""
+    if sys.platform == "win32":
+        return folder
+    return "/" + folder.lstrip("-").replace("-", "/")
+
+
+def claude_single(project_path):
+    folder, files = _claude_resolve_files(project_path)
+    if not files:
+        return None, 0, []
+    return folder, len(files), _claude_timestamps_from_files(files)
+
+
+def claude_all():
+    result = []
+    for folder in _claude_list_folders():
+        files = glob.glob(os.path.join(CLAUDE_DIR, folder, "*.jsonl"))
+        ts = _claude_timestamps_from_files(files)
+        if ts:
+            result.append((_claude_folder_to_pretty(folder), ts))
+    return result
+
+
+def _claude_list_folders():
+    return sorted(os.listdir(CLAUDE_DIR)) if os.path.exists(CLAUDE_DIR) else []
+
+
+def claude_list():
+    return _claude_list_folders()
+
+
+# --------------------------------------------------------------------------- #
+# Codex backend  ($CODEX_HOME/sessions/**/rollout-*.jsonl)
+# --------------------------------------------------------------------------- #
+
+def _codex_files():
+    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    pattern = os.path.join(codex_home, "sessions", "**", "rollout-*.jsonl")
+    return glob.glob(pattern, recursive=True)
+
+
+def _codex_parse_file(path):
+    """Return (cwd, [timestamps]) for one rollout file.
+
+    Uses the canonical `event_msg -> user_message` prompt records; only falls
+    back to `response_item` user-role messages for files that contain no
+    canonical prompt events, to avoid double counting the same input.
+    """
+    cwd = None
+    canonical = []
+    fallback = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = d.get("type")
+                payload = d.get("payload") or {}
+                if t == "session_meta":
+                    cwd = payload.get("cwd")
+                elif t == "event_msg" and payload.get("type") == "user_message":
+                    dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
+                    if dt:
+                        canonical.append(dt)
+                elif (t == "response_item"
+                      and payload.get("type") == "message"
+                      and payload.get("role") == "user"):
+                    dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
+                    if dt:
+                        fallback.append(dt)
+    except OSError:
+        return None, []
+    return cwd, sorted(canonical if canonical else fallback)
+
+
+def codex_single(project_path):
+    abs_path = os.path.abspath(os.path.expanduser(project_path))
+    matched = 0
+    timestamps = []
+    for f in _codex_files():
+        cwd, file_ts = _codex_parse_file(f)
+        if cwd == abs_path:
+            matched += 1
+            timestamps.extend(file_ts)
+    if not matched:
+        return None, 0, []
+    return abs_path, matched, sorted(timestamps)
+
+
+def codex_all():
+    groups = defaultdict(list)
+    for f in _codex_files():
+        cwd, file_ts = _codex_parse_file(f)
+        if cwd and file_ts:
+            groups[cwd].extend(file_ts)
+    return [(cwd, sorted(ts)) for cwd, ts in groups.items()]
+
+
+def _codex_cwd_only(path):
+    """Return just the session's cwd, reading only until the meta record.
+
+    `list` doesn't need prompt timestamps, so avoid parsing the whole file:
+    the `session_meta` record carrying `cwd` is at the top of the rollout.
+    """
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "session_meta":
+                    return (d.get("payload") or {}).get("cwd")
+    except OSError:
+        return None
+    return None
+
+
+def codex_list():
+    cwds = set()
+    for f in _codex_files():
+        cwd = _codex_cwd_only(f)
+        if cwd:
+            cwds.add(cwd)
+    return sorted(cwds)
+
+
+# --------------------------------------------------------------------------- #
+# Combined backend  (claude + codex merged per project)
+# --------------------------------------------------------------------------- #
+
+def _merge_projects(*project_lists):
+    """Merge [(label, timestamps)] lists, combining same-label projects."""
+    groups = defaultdict(list)
+    for projects in project_lists:
+        for label, ts in projects:
+            groups[label].extend(ts)
+    return [(label, sorted(ts)) for label, ts in groups.items()]
+
+
+def both_single(project_path):
+    _, c_count, c_ts = claude_single(project_path)
+    _, x_count, x_ts = codex_single(project_path)
+    count = c_count + x_count
+    if count == 0:
+        return None, 0, []
+    return project_path, count, sorted(c_ts + x_ts)
+
+
+def both_all():
+    return _merge_projects(claude_all(), codex_all())
+
+
+def both_list():
+    labels = {_claude_folder_to_pretty(f) for f in _claude_list_folders()}
+    labels.update(codex_list())
+    return sorted(labels)
+
+
+# --------------------------------------------------------------------------- #
+# Provider dispatch
+# --------------------------------------------------------------------------- #
+
+PROVIDERS = {
+    "claude": {
+        "single": claude_single,
+        "all": claude_all,
+        "list": claude_list,
+        "location": "~/.claude/projects/",
+    },
+    "codex": {
+        "single": codex_single,
+        "all": codex_all,
+        "list": codex_list,
+        "location": "$CODEX_HOME/sessions/",
+    },
+    "both": {
+        "single": both_single,
+        "all": both_all,
+        "list": both_list,
+        "location": "claude + codex",
+    },
+}
+
+
+def _provider_label(provider):
+    """Human display name for headers ('both' reads better spelled out)."""
+    return "CLAUDE + CODEX" if provider == "both" else provider.upper()
+
+
+# --------------------------------------------------------------------------- #
+# Output modes
+# --------------------------------------------------------------------------- #
+
+def analyze_single(provider, project_path, idle_threshold, since, until, as_json):
+    label, count, timestamps = PROVIDERS[provider]["single"](project_path)
+    timestamps = _filter_timestamps(timestamps, since, until)
+
+    if count == 0:
+        if as_json:
+            _print_json({
+                "provider": provider, "project": project_path,
+                "error": "no sessions found", "prompts": 0, "days": [],
+            })
+            sys.exit(1)
+        print(f"❌ No {provider} sessions found for: {project_path}")
+        projects = PROVIDERS[provider]["list"]()
+        if projects:
+            print(f"\n📁 Available {provider} projects ({PROVIDERS[provider]['location']}):")
+            for p in projects:
+                print(f"   {p}")
+        sys.exit(1)
+
+    if not timestamps:
+        if as_json:
+            _print_json({
+                "provider": provider, "project": project_path, "label": label,
+                "session_files": count, "since": _iso(since), "until": _iso(until),
+                "prompts": 0, "days": [],
+            })
+            sys.exit(0)
+        print("No user prompts found in the selected range.")
+        sys.exit(0)
+
+    daily, sessions = compute_active_hours(timestamps, idle_threshold)
+
+    total_minutes = sum(daily.values())
+    first_ts = timestamps[0]
+    last_ts = timestamps[-1]
+    span_days = (last_ts.date() - first_ts.date()).days + 1
+
+    prompts_per_day = defaultdict(int)
+    for ts in timestamps:
+        prompts_per_day[ts.date()] += 1
+
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "project": project_path,
+            "label": label,
+            "session_files": count,
+            "idle_threshold_min": idle_threshold,
+            "since": _iso(since),
+            "until": _iso(until),
+            "first": _iso(first_ts),
+            "last": _iso(last_ts),
+            "span_days": span_days,
+            "prompts": len(timestamps),
+            "sessions": len(sessions),
+            "active_days": len(daily),
+            "total_minutes": round(total_minutes, 2),
+            "days": [
+                {"date": str(day),
+                 "minutes": round(daily[day], 2),
+                 "prompts": prompts_per_day[day]}
+                for day in sorted(daily)
+            ],
+        })
+        return
+
+    print(f"✅ Found {count} session file(s) for: {label}\n")
+
+    print("=" * 52)
+    print(f"  CLOCKWORK — {_provider_label(provider)} SESSION ANALYSIS")
+    print("=" * 52)
+    print(f"  Project : {project_path}")
+    print(f"  First   : {first_ts.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Last    : {last_ts.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Span    : {span_days} calendar days")
+    print(f"  Prompts : {len(timestamps)} total")
+    print(f"  Sessions: {len(sessions)} (idle threshold: {idle_threshold} min)")
+    print(f"  Active  : {len(daily)} days")
+    print(f"  Total   : {fmt_duration(total_minutes)}")
+    print("=" * 52)
+
+    print(f"\n{'DATE':<14} {'ACTIVE TIME':<14} {'PROMPTS':<10} BAR")
+    print("-" * 52)
+
+    max_mins = max(daily.values())
+    for day in sorted(daily):
+        mins = daily[day]
+        bar_len = int((mins / max_mins) * 20) if max_mins else 0
+        bar = "█" * bar_len
+        print(f"  {str(day):<12} {fmt_duration(mins):<14} {prompts_per_day[day]:<10} {bar}")
+
+    print("-" * 52)
+    print(f"  {'TOTAL':<12} {fmt_duration(total_minutes):<14} {len(timestamps)}")
+    print()
+
+
+def analyze_all(provider, idle_threshold, since, until, as_json):
+    projects = PROVIDERS[provider]["all"]()
+
+    rows = []
+    grand_minutes = 0.0
+    grand_prompts = 0
+    grand_sessions = 0
+
+    for label, timestamps in projects:
+        timestamps = _filter_timestamps(timestamps, since, until)
+        if not timestamps:
+            continue
+        daily, sessions = compute_active_hours(timestamps, idle_threshold)
+        total_minutes = sum(daily.values())
+        rows.append({
+            "label": label,
+            "minutes": total_minutes,
+            "prompts": len(timestamps),
+            "sessions": len(sessions),
+        })
+        grand_minutes += total_minutes
+        grand_prompts += len(timestamps)
+        grand_sessions += len(sessions)
+
+    if not rows:
+        if as_json:
+            _print_json({
+                "provider": provider, "since": _iso(since), "until": _iso(until),
+                "projects": [],
+                "totals": {"projects": 0, "minutes": 0, "prompts": 0, "sessions": 0},
+            })
+            sys.exit(1)
+        print(f"❌ No {provider} projects with activity found ({PROVIDERS[provider]['location']})")
+        sys.exit(1)
+
+    rows.sort(key=lambda r: r["minutes"], reverse=True)
+
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "idle_threshold_min": idle_threshold,
+            "since": _iso(since),
+            "until": _iso(until),
+            "projects": [
+                {"project": r["label"],
+                 "minutes": round(r["minutes"], 2),
+                 "prompts": r["prompts"],
+                 "sessions": r["sessions"]}
+                for r in rows
+            ],
+            "totals": {
+                "projects": len(rows),
+                "minutes": round(grand_minutes, 2),
+                "prompts": grand_prompts,
+                "sessions": grand_sessions,
+            },
+        })
+        return
+
+    max_mins = max(r["minutes"] for r in rows)
+
+    print("=" * 78)
+    print(f"  CLOCKWORK — ALL {_provider_label(provider)} PROJECTS  (idle threshold: {idle_threshold} min)")
+    print("=" * 78)
+    print(f"  Projects: {len(rows)} with activity")
+    print(f"  Prompts : {grand_prompts} total")
+    print(f"  Sessions: {grand_sessions} total")
+    print(f"  Total   : {fmt_duration(grand_minutes)}")
+    print("=" * 78)
+    print()
+    print(f"  {'PROJECT':<40} {'TIME':>9} {'PROMPTS':>8} {'SESS':>5}  BAR")
+    print("-" * 78)
+
+    for r in rows:
+        name = r["label"]
+        if len(name) > 39:
+            name = "…" + name[-38:]
+        bar_len = int((r["minutes"] / max_mins) * 12) if max_mins else 0
+        bar = "█" * bar_len
+        print(f"  {name:<40} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} {r['sessions']:>5}  {bar}")
+
+    print("-" * 78)
+    print(f"  {'TOTAL':<40} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} {grand_sessions:>5}")
+    print()
+
+
+def _period_window(period):
+    """Return (since, until, title) for a named period, in local time.
+
+    `today` spans local midnight to now; `week` is a rolling 7-day window
+    ending today. Boundaries are local-time-aware so "today" means the user's
+    calendar day, not UTC's.
+    """
+    now = datetime.now().astimezone()
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "today":
+        return start_today, now, "TODAY"
+    return start_today - timedelta(days=6), now, "THIS WEEK (last 7 days)"
+
+
+def analyze_summary(provider, period, idle_threshold, as_json):
+    since, until, title = _period_window(period)
+    projects = PROVIDERS[provider]["all"]()
+
+    rows = []
+    combined_daily = defaultdict(float)
+    prompts_per_day = defaultdict(int)
+    grand_minutes = 0.0
+    grand_prompts = 0
+    grand_sessions = 0
+
+    for label, timestamps in projects:
+        timestamps = _filter_timestamps(timestamps, since, until)
+        if not timestamps:
+            continue
+        daily, sessions = compute_active_hours(timestamps, idle_threshold)
+        rows.append({
+            "label": label,
+            "minutes": sum(daily.values()),
+            "prompts": len(timestamps),
+            "sessions": len(sessions),
+        })
+        for day, mins in daily.items():
+            combined_daily[day] += mins
+        for ts in timestamps:
+            prompts_per_day[ts.date()] += 1
+        grand_minutes += sum(daily.values())
+        grand_prompts += len(timestamps)
+        grand_sessions += len(sessions)
+
+    rows.sort(key=lambda r: r["minutes"], reverse=True)
+
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "period": period,
+            "idle_threshold_min": idle_threshold,
+            "since": _iso(since),
+            "until": _iso(until),
+            "projects": [
+                {"project": r["label"],
+                 "minutes": round(r["minutes"], 2),
+                 "prompts": r["prompts"],
+                 "sessions": r["sessions"]}
+                for r in rows
+            ],
+            "days": [
+                {"date": str(day),
+                 "minutes": round(combined_daily[day], 2),
+                 "prompts": prompts_per_day[day]}
+                for day in sorted(combined_daily)
+            ],
+            "totals": {
+                "projects": len(rows),
+                "minutes": round(grand_minutes, 2),
+                "prompts": grand_prompts,
+                "sessions": grand_sessions,
+            },
+        })
+        return
+
+    width = 60
+    print("=" * width)
+    print(f"  CLOCKWORK — {_provider_label(provider)} · {title}")
+    print("=" * width)
+    if not rows:
+        print("  No activity yet. Time to write a prompt.")
+        print("=" * width)
+        print()
+        return
+    print(f"  Active   : {fmt_duration(grand_minutes)} across {len(rows)} project(s)")
+    print(f"  Prompts  : {grand_prompts}    Sessions: {grand_sessions}")
+    print("=" * width)
+    print()
+
+    print(f"  {'PROJECT':<34} {'TIME':>9} {'PROMPTS':>7}  BAR")
+    print("-" * width)
+    max_mins = max(r["minutes"] for r in rows)
+    for r in rows:
+        name = r["label"]
+        if len(name) > 33:
+            name = "…" + name[-32:]
+        bar = "█" * (int((r["minutes"] / max_mins) * 10) if max_mins else 0)
+        print(f"  {name:<34} {fmt_duration(r['minutes']):>9} {r['prompts']:>7}  {bar}")
+    print("-" * width)
+    print(f"  {'TOTAL':<34} {fmt_duration(grand_minutes):>9} {grand_prompts:>7}")
+
+    if period == "week":
+        print()
+        print(f"  {'DAY':<12} {'TIME':>9} {'PROMPTS':>7}  BAR")
+        print("-" * width)
+        max_day = max(combined_daily.values())
+        for day in sorted(combined_daily):
+            mins = combined_daily[day]
+            bar = "█" * (int((mins / max_day) * 10) if max_day else 0)
+            print(f"  {str(day):<12} {fmt_duration(mins):>9} {prompts_per_day[day]:>7}  {bar}")
+    print()
+
+
+def export_data(provider, idle_threshold, since, until, detail, anonymize):
+    """Emit one versioned JSON bundle of every project for external tools.
+
+    Always writes JSON to stdout. `detail` selects granularity:
+      daily    → per-day minutes/prompts only (smallest, least revealing)
+      sessions → adds grouped sessions with start/end + prompt counts
+      raw      → adds every prompt's epoch-second timestamp (fully re-analyzable)
+
+    Higher levels are supersets: a `raw` export still carries the daily and
+    session aggregates so a consumer can start simple and drill down.
+    Timestamps are UTC-based epoch seconds; the `daily` buckets use UTC dates.
+    """
+    projects = PROVIDERS[provider]["all"]()
+
+    out_projects = []
+    grand_minutes = 0.0
+    grand_prompts = 0
+    grand_sessions = 0
+
+    for i, (label, timestamps) in enumerate(
+            sorted(projects, key=lambda p: p[0]), start=1):
+        timestamps = _filter_timestamps(timestamps, since, until)
+        if not timestamps:
+            continue
+        daily, _ = compute_active_hours(timestamps, idle_threshold)
+        sessions = group_sessions(timestamps, idle_threshold)
+        total_minutes = sum(daily.values())
+
+        prompts_per_day = defaultdict(int)
+        for ts in timestamps:
+            prompts_per_day[ts.date()] += 1
+
+        proj = {
+            "id": _project_id(label),
+            "name": f"project-{i}" if anonymize else _display_name(label),
+            "totals": {
+                "minutes": round(total_minutes, 2),
+                "prompts": len(timestamps),
+                "sessions": len(sessions),
+                "active_days": len(daily),
+                "first": int(timestamps[0].timestamp()),
+                "last": int(timestamps[-1].timestamp()),
+            },
+            "daily": [
+                {"date": str(day),
+                 "minutes": round(daily[day], 2),
+                 "prompts": prompts_per_day[day]}
+                for day in sorted(daily)
+            ],
+        }
+        if not anonymize:
+            proj["path"] = label
+        if detail in ("sessions", "raw"):
+            proj["sessions"] = [
+                {"start": int(s.timestamp()),
+                 "end": int(e.timestamp()),
+                 "minutes": round((e - s).total_seconds() / 60, 2),
+                 "prompts": c}
+                for s, e, c in sessions
+            ]
+        if detail == "raw":
+            proj["prompts"] = [int(ts.timestamp()) for ts in timestamps]
+
+        out_projects.append(proj)
+        grand_minutes += total_minutes
+        grand_prompts += len(timestamps)
+        grand_sessions += len(sessions)
+
+    _print_json({
+        "schema": "clockwork/v1",
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "provider": provider,
+        "idle_threshold_min": idle_threshold,
+        "detail": detail,
+        "anonymized": anonymize,
+        "daily_tz": "UTC",
+        "since": _iso(since),
+        "until": _iso(until),
+        "projects": out_projects,
+        "totals": {
+            "projects": len(out_projects),
+            "minutes": round(grand_minutes, 2),
+            "prompts": grand_prompts,
+            "sessions": grand_sessions,
+        },
+    })
+
+
+def list_projects(provider, as_json):
+    projects = PROVIDERS[provider]["list"]()
+    if as_json:
+        _print_json({
+            "provider": provider,
+            "location": PROVIDERS[provider]["location"],
+            "projects": projects,
+        })
+        sys.exit(0 if projects else 1)
+    if not projects:
+        print(f"❌ No {provider} projects found ({PROVIDERS[provider]['location']})")
+        sys.exit(1)
+    print(f"📁 {len(projects)} {provider} project(s) ({PROVIDERS[provider]['location']}):\n")
+    for p in projects:
+        print(f"   {p}")
+    print()
+
+
+def _die(msg):
+    print(f"clockwork: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _parse_args(argv):
+    """Split flags from positionals. Returns (positionals, opts)."""
+    opts = {"json": False, "since": None, "until": None,
+            "detail": "raw", "anonymize": False}
+    positionals = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            opts["json"] = True
+        elif a == "--anonymize":
+            opts["anonymize"] = True
+        elif a in ("--since", "--until", "--detail"):
+            i += 1
+            if i >= len(argv):
+                _die(f"{a} requires a value")
+            opts[a[2:]] = argv[i]
+        elif a.startswith("--since="):
+            opts["since"] = a.split("=", 1)[1]
+        elif a.startswith("--until="):
+            opts["until"] = a.split("=", 1)[1]
+        elif a.startswith("--detail="):
+            opts["detail"] = a.split("=", 1)[1]
+        elif a.startswith("--"):
+            _die(f"unknown option: {a}")
+        else:
+            positionals.append(a)
+        i += 1
+    return positionals, opts
+
+
+def main():
+    positionals, opts = _parse_args(sys.argv[1:])
+    if len(positionals) < 2:
+        print(__doc__.strip())
+        sys.exit(1)
+
+    provider = positionals[0].lower()
+    if provider not in PROVIDERS:
+        print(f"Unknown provider: {positionals[0]!r} (expected 'claude', 'codex', or 'both')\n")
+        print(__doc__.strip())
+        sys.exit(1)
+
+    target = positionals[1]
+    idle_threshold = int(positionals[2]) if len(positionals) > 2 else 30
+
+    if opts["detail"] not in ("raw", "sessions", "daily"):
+        _die(f"--detail must be raw, sessions, or daily (got {opts['detail']!r})")
+
+    try:
+        since = _parse_date_bound(opts["since"])
+        until = _parse_date_bound(opts["until"], end_of_day=True)
+    except ValueError as e:
+        _die(str(e))
+
+    if target == "all":
+        analyze_all(provider, idle_threshold, since, until, opts["json"])
+    elif target in ("today", "week"):
+        analyze_summary(provider, target, idle_threshold, opts["json"])
+    elif target == "export":
+        export_data(provider, idle_threshold, since, until,
+                    opts["detail"], opts["anonymize"])
+    elif target == "list":
+        list_projects(provider, opts["json"])
+    else:
+        analyze_single(provider, target, idle_threshold, since, until, opts["json"])
