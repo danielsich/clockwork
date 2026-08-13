@@ -981,7 +981,25 @@ def _parse_args(argv):
     return positionals, opts
 
 
+def _force_utf8_streams():
+    """Write UTF-8 on stdout/stderr regardless of the platform locale.
+
+    Windows falls back to the locale codepage (usually cp1252) whenever output
+    is redirected to a file or pipe, and the bar glyph and status marks used
+    below are not encodable there. Reconfiguring keeps output byte-identical
+    across platforms; the JSON export is pure ASCII either way.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            # Detached or replaced streams (test capture, some launchers) have
+            # nothing to reconfigure; whatever encoding they carry stands.
+            pass
+
+
 def main():
+    _force_utf8_streams()
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
         print(__doc__.strip())
