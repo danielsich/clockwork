@@ -55,7 +55,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 def _resolve_claude_dir():
@@ -270,7 +270,7 @@ def _claude_timestamps_from_files(files):
     """Parse user/human turn timestamps from Claude .jsonl files."""
     timestamps = []
     for f in sorted(files):
-        with open(f) as fh:
+        with open(f, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -339,7 +339,7 @@ def _codex_parse_file(path):
     canonical = []
     fallback = []
     try:
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -397,7 +397,7 @@ def _codex_cwd_only(path):
     the `session_meta` record carrying `cwd` is at the top of the rollout.
     """
     try:
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
