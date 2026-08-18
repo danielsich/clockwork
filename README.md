@@ -123,6 +123,7 @@ Options:
                     form like 7d (7 days ago) or 2w (2 weeks ago)
   --detail <level>  export granularity: raw | sessions | daily (default raw)
   --anonymize       export: replace project paths with a hash id + generic name
+  --tokens          Also report token usage and a per-model breakdown
 ```
 
 ### Examples
@@ -156,6 +157,10 @@ clockwork claude all --since 7d
 # A specific date range for one project
 clockwork claude ~/dev/myproject --since 2026-07-01 --until 2026-07-05
 
+# Token and model usage, alongside the timings
+clockwork claude all --tokens
+clockwork both today --tokens
+
 # Machine-readable output — pipe into jq, a spreadsheet, or a dashboard
 clockwork codex all --json | jq '.projects[] | {project, minutes}'
 ```
@@ -187,6 +192,58 @@ analysis).
 usage still go to stderr), so clockwork composes with `jq`, cron jobs, or any
 dashboard. Exit codes are script-friendly: `0` on success, `1` when nothing
 matched, `2` for bad arguments.
+
+### Token & model usage (`--tokens`)
+
+`--tokens` adds token counts and a per-model breakdown to any command. It reads
+the usage each tool already records next to your prompts — nothing is estimated,
+and no API is called.
+
+```
+  Tokens  : 760.7M across 6,739 responses
+  In/Out  : 1.6M in · 5.7M out
+  Cache   : 731.7M read · 21.7M write
+========================================================================================
+
+  PROJECT                             TIME  PROMPTS       IN      OUT     CACHE     TOTAL
+----------------------------------------------------------------------------------------
+  /Users/you/dev/alpha             54h 08m     3693     1.1M     2.8M    394.8M    398.7M
+  /Users/you/dev/beta              19h 01m     1414   196.4k   870.7k    121.5M    122.6M
+
+  MODEL                   RESP     INPUT    OUTPUT   CACHE R   CACHE W     TOTAL
+--------------------------------------------------------------------------------
+  claude-opus-4-8        4,732      1.4M      4.3M     572.0M     15.9M    593.7M
+  claude-sonnet-4-6      1,431     10.2k    786.0k     108.8M      2.8M    111.6M
+```
+
+**The counts are normalized across the two tools**, because they don't report
+the same way:
+
+| field         | meaning                        | claude | codex |
+| ------------- | ------------------------------ | ------ | ----- |
+| `input`       | fresh (uncached) input tokens  | as reported | `input_tokens` minus `cached_input_tokens`, which Codex nests inside it |
+| `output`      | output tokens                  | includes thinking | includes reasoning |
+| `cache_read`  | input served from cache        | `cache_read_input_tokens` | `cached_input_tokens` |
+| `cache_write` | input written to cache         | `cache_creation_input_tokens` | never reported (always 0) |
+| `reasoning`   | thinking tokens, a *subset* of `output` | not broken out (always 0) | `reasoning_output_tokens` |
+
+`total` is `input + output + cache_read + cache_write`; `reasoning` is
+deliberately left out of it, since `output` already covers those tokens.
+
+Two counting traps are handled for you, both of which inflate the numbers if
+you read the logs naively:
+
+- **Claude** writes one line per content block — thinking, text, and each tool
+  call — and every line of a single API response repeats the *identical* usage
+  block. Counting per line overstates usage roughly 2.6x, so responses are
+  deduplicated on their message id.
+- **Codex** re-emits a stale `last_token_usage` on aborted and no-op turns that
+  its cumulative counter never absorbs, so a turn's real cost is read as the
+  rise in `total_token_usage` instead. The model name comes from the preceding
+  `turn_context` record (`session_meta` only names the provider).
+
+What it can't tell you is cost — the logs carry no prices, and subscription
+usage isn't billed per token anyway.
 
 ## Exporting for external tools
 
@@ -240,17 +297,18 @@ for a combined view, so nothing is lost either way.
 - `totals.by_provider` breaks the grand totals down per provider; the grand
   `totals` stay the cross-provider sum.
 
-### Export schema (`clockwork/v2`)
+### Export schema (`clockwork/v3`)
 
 ```jsonc
 {
-  "schema": "clockwork/v2",
+  "schema": "clockwork/v3",
   "generated_at": "2026-07-06T00:30:00+02:00",  // local ISO-8601
   "provider": "both",         // "claude" | "codex" | "both"
   "providers": ["claude", "codex"],  // sorted, distinct; ≥ 1 element
   "idle_threshold_min": 30,
   "detail": "raw",           // raw | sessions | daily
   "anonymized": false,
+  "tokens": false,           // true when --tokens was given (adds the fields below)
   "daily_tz": "UTC",         // the "daily" buckets use UTC calendar dates
   "since": null,             // ISO bound if --since was given, else null
   "until": null,
@@ -266,6 +324,19 @@ for a combined view, so nothing is lost either way.
         "first": 1780521570, "last": 1782130426   // epoch seconds
       },
       "daily":    [ { "date": "2026-06-03", "minutes": 4.34, "prompts": 27 } ],
+      // every "tokens" block below appears only with --tokens
+      "tokens": {
+        "responses": 373,    // API responses, deduplicated
+        "input": 31065, "output": 287747,
+        "cache_read": 20753836, "cache_write": 579725,
+        "reasoning": 0,      // subset of output; Codex only
+        "total": 21652373,   // input + output + cache_read + cache_write
+        "by_model": [        // biggest consumer first
+          { "model": "claude-opus-4-8", "responses": 238, "input": 30046,
+            "output": 177141, "cache_read": 13207329, "cache_write": 352749,
+            "reasoning": 0, "total": 13767265 }
+        ]
+      },
       "sessions": [ { "start": 1780521570, "end": 1780521830,
                       "minutes": 4.34, "prompts": 27 } ],  // detail >= sessions
       "prompts":  [ 1780521570, 1780521582 ]               // detail == raw
@@ -273,9 +344,12 @@ for a combined view, so nothing is lost either way.
   ],
   "totals": {
     "projects": 6, "minutes": 3392.97, "prompts": 4588, "sessions": 64,
+    "tokens": { /* same shape, summed across every project */ },
     "by_provider": {
-      "claude": { "projects": 4, "minutes": 2500.0, "prompts": 3000, "sessions": 40 },
-      "codex":  { "projects": 2, "minutes": 892.97, "prompts": 1588, "sessions": 24 }
+      "claude": { "projects": 4, "minutes": 2500.0, "prompts": 3000, "sessions": 40,
+                  "tokens": { /* ... */ } },
+      "codex":  { "projects": 2, "minutes": 892.97, "prompts": 1588, "sessions": 24,
+                  "tokens": { /* ... */ } }
     }
   }
 }
@@ -283,8 +357,14 @@ for a combined view, so nothing is lost either way.
 
 All instants are **UTC-based epoch seconds** (`new Date(sec * 1000)` in JS), so
 the consumer picks the display timezone. The `schema` field is the version
-contract — `clockwork/v2` is a breaking bump over `v1` (provider moved to the
-project level), so tools should guard on it.
+contract — `clockwork/v2` was a breaking bump over `v1` (provider moved to the
+project level), so tools should guard on it. `clockwork/v3` is **additive
+only**: it adds the `tokens` flag and the `tokens` blocks described above, and a
+v2 consumer reads a v3 bundle unchanged.
+
+The per-day `tokens` buckets sum to the project's `tokens`, project totals sum
+to `totals.by_provider`, and those sum to `totals.tokens` — at every level, and
+per model.
 
 ## License
 

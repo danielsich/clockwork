@@ -27,6 +27,7 @@ Options:
                     form like 7d (7 days ago) or 2w (2 weeks ago)
   --detail <level>  export granularity: raw | sessions | daily (default raw)
   --anonymize       export: replace project paths with a hash id + generic name
+  --tokens          Also report token usage and a per-model breakdown
 
 Examples:
   clockwork claude ~/code/myproject
@@ -38,6 +39,9 @@ Examples:
   clockwork both today
   clockwork claude export > clockwork.json
   clockwork codex export --detail sessions --anonymize > share.json
+  clockwork both today --tokens
+  clockwork claude all --tokens --since 7d
+  clockwork both export --tokens > clockwork.json
   clockwork claude all --since 7d
   clockwork claude ~/code/myproject --since 2026-07-01 --until 2026-07-05
   clockwork claude list
@@ -45,6 +49,20 @@ Examples:
 Data sources:
   claude → ~/.claude/projects/<encoded-path>/*.jsonl
   codex  → $CODEX_HOME/sessions/**/rollout-*.jsonl   (default ~/.codex/sessions)
+
+Token usage (--tokens):
+  Both tools log per-response usage, counted differently, so clockwork
+  normalizes them before summing:
+
+  claude → `assistant` records carry message.model + message.usage. One API
+           response spans several lines (thinking, text, each tool_use), each
+           repeating the same usage block, so responses are deduplicated on
+           message id. Cache reads/writes sit outside input_tokens.
+  codex  → `event_msg -> token_count` records carry a cumulative
+           total_token_usage; per-turn cost is read as the rise in that counter
+           because last_token_usage is re-emitted on aborted turns. The model
+           comes from the preceding `turn_context`, and cached_input_tokens is
+           subtracted out of input_tokens to match Claude's split.
 """
 
 import sys
@@ -125,6 +143,92 @@ def _add_session_to_daily(daily, start, end):
         seg_end = min(end, next_midnight)
         daily[cursor.date()] += (seg_end - cursor).total_seconds() / 60
         cursor = seg_end
+
+
+# --------------------------------------------------------------------------- #
+# Token accounting
+# --------------------------------------------------------------------------- #
+#
+# Both providers log per-response token usage, but they count it differently,
+# so every backend normalizes into one record shape before anything is summed:
+#
+#   input        fresh (uncached) input tokens
+#   output       output tokens, thinking/reasoning included
+#   cache_read   input served from cache
+#   cache_write  input written to cache   (Claude only; Codex never reports it)
+#   reasoning    thinking tokens, a SUBSET of output (Codex only; Claude folds
+#                thinking into output without breaking it out)
+#
+# Claude reports cache reads and writes outside `input_tokens`; Codex reports
+# `cached_input_tokens` *inside* `input_tokens`, so the Codex reader subtracts
+# it back out. After that, total = input + output + cache_read + cache_write
+# holds for both, and `reasoning` is deliberately left out of it to avoid
+# double counting the part of output it already covers.
+
+TOKEN_FIELDS = ("input", "output", "cache_read", "cache_write", "reasoning")
+
+
+def _new_token_rec():
+    rec = {"responses": 0}
+    rec.update({f: 0 for f in TOKEN_FIELDS})
+    return rec
+
+
+def _accumulate_tokens(rec, event):
+    rec["responses"] += 1
+    for f in TOKEN_FIELDS:
+        rec[f] += event[f]
+
+
+def _sealed(rec):
+    """Copy a running record with its derived `total` filled in."""
+    out = dict(rec)
+    out["total"] = rec["input"] + rec["output"] + rec["cache_read"] + rec["cache_write"]
+    return out
+
+
+def summarize_tokens(events):
+    """Aggregate token events into overall totals plus a per-model breakdown."""
+    overall = _new_token_rec()
+    per_model = defaultdict(_new_token_rec)
+    for event in events:
+        _accumulate_tokens(overall, event)
+        _accumulate_tokens(per_model[event["model"] or "unknown"], event)
+    summary = _sealed(overall)
+    models = []
+    for model, rec in per_model.items():
+        entry = {"model": model}
+        entry.update(_sealed(rec))
+        models.append(entry)
+    # Biggest consumer first, name as the tie-break so output is deterministic.
+    models.sort(key=lambda m: (-m["total"], m["model"]))
+    summary["by_model"] = models
+    return summary
+
+
+def tokens_by_day(events):
+    """Bucket token events into per-day (UTC) sealed records."""
+    daily = defaultdict(_new_token_rec)
+    for event in events:
+        _accumulate_tokens(daily[event["ts"].date()], event)
+    return {day: _sealed(rec) for day, rec in daily.items()}
+
+
+def _filter_events(events, since, until):
+    if since is None and until is None:
+        return events
+    return [
+        e for e in events
+        if (since is None or e["ts"] >= since) and (until is None or e["ts"] <= until)
+    ]
+
+
+def fmt_tokens(n):
+    """Compact token count for table cells (1_234_567 -> '1.2M')."""
+    for cutoff, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= cutoff:
+            return f"{n / cutoff:.1f}{suffix}"
+    return str(int(n))
 
 
 def fmt_duration(minutes):
@@ -264,9 +368,48 @@ def _claude_resolve_files(project_path):
     return None, []
 
 
-def _claude_timestamps_from_files(files):
-    """Parse user/human turn timestamps from Claude .jsonl files."""
+def _claude_token_event(record, dt, seen):
+    """Normalize one Claude assistant record into a token event, or None.
+
+    Claude Code writes one line per content block — thinking, text, and each
+    tool_use — and every line of a single API response repeats the *identical*
+    usage object. Counting per line inflates totals roughly 2.6x, so responses
+    are deduplicated on the message id (falling back to the request id).
+    """
+    message = record.get("message") or {}
+    usage = message.get("usage")
+    model = message.get("model")
+    # `<synthetic>` marks locally generated messages (errors, interrupts);
+    # they carry a zero usage block and never hit the API.
+    if not usage or not model or model == "<synthetic>" or dt is None:
+        return None
+    key = message.get("id") or record.get("requestId")
+    if key is not None:
+        if key in seen:
+            return None
+        seen.add(key)
+    return {
+        "ts": dt,
+        "model": model,
+        "input": usage.get("input_tokens") or 0,
+        "output": usage.get("output_tokens") or 0,
+        "cache_read": usage.get("cache_read_input_tokens") or 0,
+        "cache_write": usage.get("cache_creation_input_tokens") or 0,
+        "reasoning": 0,  # Claude folds thinking into output_tokens
+    }
+
+
+def _claude_scan_files(files):
+    """Return (prompt timestamps, token events) from Claude .jsonl files.
+
+    Both come out of a single pass: the files are already read end to end for
+    the timestamps, so picking up usage costs nothing extra. The dedup set is
+    shared across the whole file list so a response replayed into a resumed
+    session's log is still only counted once.
+    """
     timestamps = []
+    events = []
+    seen = set()
     for f in sorted(files):
         with open(f, encoding="utf-8") as fh:
             for line in fh:
@@ -281,7 +424,16 @@ def _claude_timestamps_from_files(files):
                 dt = _parse_ts(d.get("timestamp"))
                 if dt and role in ("human", "user"):
                     timestamps.append(dt)
-    return sorted(timestamps)
+                elif role == "assistant":
+                    event = _claude_token_event(d, dt, seen)
+                    if event:
+                        events.append(event)
+    return sorted(timestamps), events
+
+
+def _claude_timestamps_from_files(files):
+    """Parse user/human turn timestamps from Claude .jsonl files."""
+    return _claude_scan_files(files)[0]
 
 
 def _claude_folder_to_pretty(folder):
@@ -291,21 +443,31 @@ def _claude_folder_to_pretty(folder):
     return "/" + folder.lstrip("-").replace("-", "/")
 
 
-def claude_single(project_path):
+def claude_scan_single(project_path):
     folder, files = _claude_resolve_files(project_path)
     if not files:
-        return None, 0, []
-    return folder, len(files), _claude_timestamps_from_files(files)
+        return None, 0, [], []
+    ts, events = _claude_scan_files(files)
+    return folder, len(files), ts, events
 
 
-def claude_all():
+def claude_single(project_path):
+    folder, count, ts, _ = claude_scan_single(project_path)
+    return folder, count, ts
+
+
+def claude_scan():
     result = []
     for folder in _claude_list_folders():
         files = glob.glob(os.path.join(CLAUDE_DIR, folder, "*.jsonl"))
-        ts = _claude_timestamps_from_files(files)
+        ts, events = _claude_scan_files(files)
         if ts:
-            result.append((_claude_folder_to_pretty(folder), ts))
+            result.append((_claude_folder_to_pretty(folder), ts, events))
     return result
+
+
+def claude_all():
+    return [(label, ts) for label, ts, _ in claude_scan()]
 
 
 def _claude_list_folders():
@@ -326,16 +488,64 @@ def _codex_files():
     return glob.glob(pattern, recursive=True)
 
 
-def _codex_parse_file(path):
-    """Return (cwd, [timestamps]) for one rollout file.
+_CODEX_TOKEN_KEYS = ("input_tokens", "cached_input_tokens",
+                     "output_tokens", "reasoning_output_tokens")
+
+
+def _codex_token_event(record, payload, running, model):
+    """Normalize one Codex `token_count` record into a token event, or None.
+
+    Codex reports both a per-turn `last_token_usage` and a cumulative
+    `total_token_usage`, and the per-turn number cannot be trusted on its own:
+    aborted and no-op turns re-emit a stale `last_token_usage` that the
+    cumulative counter never absorbs, so summing it overstates usage (by up to
+    20% in a single session). The turn's real cost is the rise in the
+    cumulative counter, which is monotonic within a rollout and restarts at
+    zero in forked/resumed sessions — so no cross-file double counting either.
+    """
+    info = payload.get("info") or {}
+    total = info.get("total_token_usage") or {}
+    delta = {}
+    for k in _CODEX_TOKEN_KEYS:
+        value = total.get(k) or 0
+        delta[k] = max(0, value - running[k])
+        running[k] = value
+    if not any(delta.values()):
+        return None
+    dt = _parse_ts(record.get("timestamp") or payload.get("timestamp"))
+    if dt is None:
+        return None
+    cached = delta["cached_input_tokens"]
+    return {
+        "ts": dt,
+        "model": model,
+        # Codex counts cache reads inside input_tokens; split them back out so
+        # the number means the same thing it does on the Claude side.
+        "input": max(0, delta["input_tokens"] - cached),
+        "output": delta["output_tokens"],
+        "cache_read": cached,
+        "cache_write": 0,  # not reported by Codex
+        "reasoning": delta["reasoning_output_tokens"],
+    }
+
+
+def _codex_scan_file(path):
+    """Return (cwd, [timestamps], [token events]) for one rollout file.
 
     Uses the canonical `event_msg -> user_message` prompt records; only falls
     back to `response_item` user-role messages for files that contain no
     canonical prompt events, to avoid double counting the same input.
+
+    The model is not in `session_meta` (which only names the provider) — it
+    rides on `turn_context`, so each turn is attributed to the most recent one.
     """
     cwd = None
     canonical = []
     fallback = []
+    events = []
+    model = None
+    first_model = None
+    running = {k: 0 for k in _CODEX_TOKEN_KEYS}
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
@@ -350,10 +560,18 @@ def _codex_parse_file(path):
                 payload = d.get("payload") or {}
                 if t == "session_meta":
                     cwd = payload.get("cwd")
+                elif t == "turn_context":
+                    model = payload.get("model") or model
+                    if first_model is None:
+                        first_model = model
                 elif t == "event_msg" and payload.get("type") == "user_message":
                     dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
                     if dt:
                         canonical.append(dt)
+                elif t == "event_msg" and payload.get("type") == "token_count":
+                    event = _codex_token_event(d, payload, running, model)
+                    if event:
+                        events.append(event)
                 elif (t == "response_item"
                       and payload.get("type") == "message"
                       and payload.get("role") == "user"):
@@ -361,31 +579,56 @@ def _codex_parse_file(path):
                     if dt:
                         fallback.append(dt)
     except OSError:
-        return None, []
-    return cwd, sorted(canonical if canonical else fallback)
+        return None, [], []
+    # A few turns are logged before the first `turn_context`; credit them to
+    # the model the session went on to use rather than losing them to unknown.
+    if first_model:
+        for event in events:
+            if event["model"] is None:
+                event["model"] = first_model
+    return cwd, sorted(canonical if canonical else fallback), events
 
 
-def codex_single(project_path):
+def _codex_parse_file(path):
+    """Return (cwd, [timestamps]) for one rollout file."""
+    cwd, timestamps, _ = _codex_scan_file(path)
+    return cwd, timestamps
+
+
+def codex_scan_single(project_path):
     abs_path = os.path.abspath(os.path.expanduser(project_path))
     matched = 0
     timestamps = []
+    events = []
     for f in _codex_files():
-        cwd, file_ts = _codex_parse_file(f)
+        cwd, file_ts, file_events = _codex_scan_file(f)
         if cwd == abs_path:
             matched += 1
             timestamps.extend(file_ts)
+            events.extend(file_events)
     if not matched:
-        return None, 0, []
-    return abs_path, matched, sorted(timestamps)
+        return None, 0, [], []
+    return abs_path, matched, sorted(timestamps), events
+
+
+def codex_single(project_path):
+    label, count, ts, _ = codex_scan_single(project_path)
+    return label, count, ts
+
+
+def codex_scan():
+    ts_groups = defaultdict(list)
+    event_groups = defaultdict(list)
+    for f in _codex_files():
+        cwd, file_ts, file_events = _codex_scan_file(f)
+        if cwd and file_ts:
+            ts_groups[cwd].extend(file_ts)
+            event_groups[cwd].extend(file_events)
+    return [(cwd, sorted(ts), event_groups[cwd]) for cwd, ts in ts_groups.items()]
 
 
 def codex_all():
-    groups = defaultdict(list)
-    for f in _codex_files():
-        cwd, file_ts = _codex_parse_file(f)
-        if cwd and file_ts:
-            groups[cwd].extend(file_ts)
-    return [(cwd, sorted(ts)) for cwd, ts in groups.items()]
+    return [(label, ts) for label, ts, _ in codex_scan()]
 
 
 def _codex_cwd_only(path):
@@ -433,13 +676,34 @@ def _merge_projects(*project_lists):
     return [(label, sorted(ts)) for label, ts in groups.items()]
 
 
-def both_single(project_path):
-    _, c_count, c_ts = claude_single(project_path)
-    _, x_count, x_ts = codex_single(project_path)
+def _merge_scans(*scans):
+    """Merge [(label, timestamps, events)] lists, combining same-label projects."""
+    ts_groups = defaultdict(list)
+    event_groups = defaultdict(list)
+    for scan in scans:
+        for label, ts, events in scan:
+            ts_groups[label].extend(ts)
+            event_groups[label].extend(events)
+    return [(label, sorted(ts), event_groups[label])
+            for label, ts in ts_groups.items()]
+
+
+def both_scan_single(project_path):
+    _, c_count, c_ts, c_events = claude_scan_single(project_path)
+    _, x_count, x_ts, x_events = codex_scan_single(project_path)
     count = c_count + x_count
     if count == 0:
-        return None, 0, []
-    return project_path, count, sorted(c_ts + x_ts)
+        return None, 0, [], []
+    return project_path, count, sorted(c_ts + x_ts), c_events + x_events
+
+
+def both_single(project_path):
+    label, count, ts, _ = both_scan_single(project_path)
+    return label, count, ts
+
+
+def both_scan():
+    return _merge_scans(claude_scan(), codex_scan())
 
 
 def both_all():
@@ -456,22 +720,31 @@ def both_list():
 # Provider dispatch
 # --------------------------------------------------------------------------- #
 
+# `scan`/`scan_single` are the token-aware backends: same work as `all`/`single`
+# plus the usage records picked up in the same pass. `all`/`single` remain the
+# timing-only views, and are what the plain (no --tokens) commands read.
 PROVIDERS = {
     "claude": {
         "single": claude_single,
+        "scan_single": claude_scan_single,
         "all": claude_all,
+        "scan": claude_scan,
         "list": claude_list,
         "location": "~/.claude/projects/",
     },
     "codex": {
         "single": codex_single,
+        "scan_single": codex_scan_single,
         "all": codex_all,
+        "scan": codex_scan,
         "list": codex_list,
         "location": "$CODEX_HOME/sessions/",
     },
     "both": {
         "single": both_single,
+        "scan_single": both_scan_single,
         "all": both_all,
+        "scan": both_scan,
         "list": both_list,
         "location": "claude + codex",
     },
@@ -496,8 +769,72 @@ def _export_providers(provider):
 # Output modes
 # --------------------------------------------------------------------------- #
 
-def analyze_single(provider, project_path, idle_threshold, since, until, as_json):
-    label, count, timestamps = PROVIDERS[provider]["single"](project_path)
+MODEL_TABLE_WIDTH = 80
+
+
+def _day_keys(daily, token_days):
+    """Every day either bucket knows about, in order.
+
+    A response can complete after midnight, past the last prompt that defines
+    the session's end — so a day can carry tokens without carrying active
+    minutes. Taking the union keeps the per-day rows summing to the totals.
+    """
+    return sorted(set(daily) | set(token_days))
+
+
+def _day_entry(day, daily, prompts_per_day, token_days, show_tokens):
+    """One JSON day bucket, with tokens attached when they were collected."""
+    entry = {"date": str(day),
+             "minutes": round(daily[day], 2),
+             "prompts": prompts_per_day[day]}
+    if show_tokens:
+        entry["tokens"] = token_days.get(day) or _sealed(_new_token_rec())
+    return entry
+
+
+def _print_token_lines(summary):
+    """The three-line token block used under a run's summary header."""
+    print(f"  Tokens  : {fmt_tokens(summary['total'])} across "
+          f"{summary['responses']:,} responses")
+    print(f"  In/Out  : {fmt_tokens(summary['input'])} in · "
+          f"{fmt_tokens(summary['output'])} out")
+    print(f"  Cache   : {fmt_tokens(summary['cache_read'])} read · "
+          f"{fmt_tokens(summary['cache_write'])} write")
+    if summary["reasoning"]:
+        print(f"  Thinking: {fmt_tokens(summary['reasoning'])} "
+              f"(Codex only; already counted inside output)")
+
+
+def _print_model_table(summary):
+    """Per-model token breakdown, biggest consumer first."""
+    if not summary["by_model"]:
+        return
+    print(f"\n  {'MODEL':<20} {'RESP':>7} {'INPUT':>9} {'OUTPUT':>9} "
+          f"{'CACHE R':>9} {'CACHE W':>9} {'TOTAL':>9}")
+    print("-" * MODEL_TABLE_WIDTH)
+    for m in summary["by_model"]:
+        name = m["model"]
+        if len(name) > 19:
+            name = "…" + name[-18:]
+        print(f"  {name:<20} {m['responses']:>7,} {fmt_tokens(m['input']):>9} "
+              f"{fmt_tokens(m['output']):>9} {fmt_tokens(m['cache_read']):>9} "
+              f"{fmt_tokens(m['cache_write']):>9} {fmt_tokens(m['total']):>9}")
+    print("-" * MODEL_TABLE_WIDTH)
+    print(f"  {'TOTAL':<20} {summary['responses']:>7,} "
+          f"{fmt_tokens(summary['input']):>9} {fmt_tokens(summary['output']):>9} "
+          f"{fmt_tokens(summary['cache_read']):>9} "
+          f"{fmt_tokens(summary['cache_write']):>9} "
+          f"{fmt_tokens(summary['total']):>9}")
+
+
+def analyze_single(provider, project_path, idle_threshold, since, until, as_json,
+                   show_tokens=False):
+    if show_tokens:
+        label, count, timestamps, events = PROVIDERS[provider]["scan_single"](project_path)
+        events = _filter_events(events, since, until)
+    else:
+        label, count, timestamps = PROVIDERS[provider]["single"](project_path)
+        events = []
     timestamps = _filter_timestamps(timestamps, since, until)
 
     if count == 0:
@@ -537,8 +874,11 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
     for ts in timestamps:
         prompts_per_day[ts.date()] += 1
 
+    token_summary = summarize_tokens(events) if show_tokens else None
+    token_days = tokens_by_day(events) if show_tokens else {}
+
     if as_json:
-        _print_json({
+        payload = {
             "provider": provider,
             "project": project_path,
             "label": label,
@@ -554,12 +894,13 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
             "active_days": len(daily),
             "total_minutes": round(total_minutes, 2),
             "days": [
-                {"date": str(day),
-                 "minutes": round(daily[day], 2),
-                 "prompts": prompts_per_day[day]}
-                for day in sorted(daily)
+                _day_entry(day, daily, prompts_per_day, token_days, show_tokens)
+                for day in _day_keys(daily, token_days)
             ],
-        })
+        }
+        if show_tokens:
+            payload["tokens"] = token_summary
+        _print_json(payload)
         return
 
     print(f"✅ Found {count} session file(s) for: {label}\n")
@@ -575,35 +916,52 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
     print(f"  Sessions: {len(sessions)} (idle threshold: {idle_threshold} min)")
     print(f"  Active  : {len(daily)} days")
     print(f"  Total   : {fmt_duration(total_minutes)}")
+    if show_tokens:
+        _print_token_lines(token_summary)
     print("=" * 52)
 
-    print(f"\n{'DATE':<14} {'ACTIVE TIME':<14} {'PROMPTS':<10} BAR")
-    print("-" * 52)
+    token_col = f" {'TOKENS':>9}" if show_tokens else ""
+    print(f"\n{'DATE':<14} {'ACTIVE TIME':<14} {'PROMPTS':<10}{token_col} BAR")
+    print("-" * (52 + len(token_col)))
 
     max_mins = max(daily.values())
-    for day in sorted(daily):
+    for day in _day_keys(daily, token_days):
         mins = daily[day]
         bar_len = int((mins / max_mins) * 20) if max_mins else 0
         bar = "█" * bar_len
-        print(f"  {str(day):<12} {fmt_duration(mins):<14} {prompts_per_day[day]:<10} {bar}")
+        cell = (f" {fmt_tokens(token_days.get(day, {}).get('total', 0)):>9}"
+                if show_tokens else "")
+        print(f"  {str(day):<12} {fmt_duration(mins):<14} "
+              f"{prompts_per_day[day]:<10}{cell} {bar}")
 
-    print("-" * 52)
-    print(f"  {'TOTAL':<12} {fmt_duration(total_minutes):<14} {len(timestamps)}")
+    print("-" * (52 + len(token_col)))
+    total_cell = f" {fmt_tokens(token_summary['total']):>9}" if show_tokens else ""
+    # rstrip so the plain (no --tokens) row keeps its original width.
+    print(f"  {'TOTAL':<12} {fmt_duration(total_minutes):<14} "
+          f"{len(timestamps):<10}{total_cell}".rstrip())
+    if show_tokens:
+        _print_model_table(token_summary)
     print()
 
 
-def analyze_all(provider, idle_threshold, since, until, as_json):
-    projects = PROVIDERS[provider]["all"]()
+def analyze_all(provider, idle_threshold, since, until, as_json,
+                show_tokens=False):
+    if show_tokens:
+        projects = PROVIDERS[provider]["scan"]()
+    else:
+        projects = [(label, ts, []) for label, ts in PROVIDERS[provider]["all"]()]
 
     rows = []
+    all_events = []
     grand_minutes = 0.0
     grand_prompts = 0
     grand_sessions = 0
 
-    for label, timestamps in projects:
+    for label, timestamps, events in projects:
         timestamps = _filter_timestamps(timestamps, since, until)
         if not timestamps:
             continue
+        events = _filter_events(events, since, until)
         daily, sessions = compute_active_hours(timestamps, idle_threshold)
         total_minutes = sum(daily.values())
         rows.append({
@@ -611,7 +969,9 @@ def analyze_all(provider, idle_threshold, since, until, as_json):
             "minutes": total_minutes,
             "prompts": len(timestamps),
             "sessions": len(sessions),
+            "tokens": summarize_tokens(events) if show_tokens else None,
         })
+        all_events.extend(events)
         grand_minutes += total_minutes
         grand_prompts += len(timestamps)
         grand_sessions += len(sessions)
@@ -628,53 +988,86 @@ def analyze_all(provider, idle_threshold, since, until, as_json):
         sys.exit(1)
 
     rows.sort(key=lambda r: r["minutes"], reverse=True)
+    grand_tokens = summarize_tokens(all_events) if show_tokens else None
 
     if as_json:
+        projects_json = []
+        for r in rows:
+            entry = {"project": r["label"],
+                     "minutes": round(r["minutes"], 2),
+                     "prompts": r["prompts"],
+                     "sessions": r["sessions"]}
+            if show_tokens:
+                entry["tokens"] = r["tokens"]
+            projects_json.append(entry)
+        totals = {
+            "projects": len(rows),
+            "minutes": round(grand_minutes, 2),
+            "prompts": grand_prompts,
+            "sessions": grand_sessions,
+        }
+        if show_tokens:
+            totals["tokens"] = grand_tokens
         _print_json({
             "provider": provider,
             "idle_threshold_min": idle_threshold,
             "since": _iso(since),
             "until": _iso(until),
-            "projects": [
-                {"project": r["label"],
-                 "minutes": round(r["minutes"], 2),
-                 "prompts": r["prompts"],
-                 "sessions": r["sessions"]}
-                for r in rows
-            ],
-            "totals": {
-                "projects": len(rows),
-                "minutes": round(grand_minutes, 2),
-                "prompts": grand_prompts,
-                "sessions": grand_sessions,
-            },
+            "projects": projects_json,
+            "totals": totals,
         })
         return
 
     max_mins = max(r["minutes"] for r in rows)
+    width = 88 if show_tokens else 78
 
-    print("=" * 78)
+    print("=" * width)
     print(f"  CLOCKWORK — ALL {_provider_label(provider)} PROJECTS  (idle threshold: {idle_threshold} min)")
-    print("=" * 78)
+    print("=" * width)
     print(f"  Projects: {len(rows)} with activity")
     print(f"  Prompts : {grand_prompts} total")
     print(f"  Sessions: {grand_sessions} total")
     print(f"  Total   : {fmt_duration(grand_minutes)}")
-    print("=" * 78)
+    if show_tokens:
+        _print_token_lines(grand_tokens)
+    print("=" * width)
     print()
-    print(f"  {'PROJECT':<40} {'TIME':>9} {'PROMPTS':>8} {'SESS':>5}  BAR")
-    print("-" * 78)
+
+    if show_tokens:
+        # Token columns replace the bar — the numbers carry the comparison.
+        print(f"  {'PROJECT':<30} {'TIME':>9} {'PROMPTS':>8} {'IN':>8} "
+              f"{'OUT':>8} {'CACHE':>9} {'TOTAL':>9}")
+    else:
+        print(f"  {'PROJECT':<40} {'TIME':>9} {'PROMPTS':>8} {'SESS':>5}  BAR")
+    print("-" * width)
 
     for r in rows:
         name = r["label"]
-        if len(name) > 39:
-            name = "…" + name[-38:]
-        bar_len = int((r["minutes"] / max_mins) * 12) if max_mins else 0
-        bar = "█" * bar_len
-        print(f"  {name:<40} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} {r['sessions']:>5}  {bar}")
+        if show_tokens:
+            if len(name) > 29:
+                name = "…" + name[-28:]
+            t = r["tokens"]
+            print(f"  {name:<30} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} "
+                  f"{fmt_tokens(t['input']):>8} {fmt_tokens(t['output']):>8} "
+                  f"{fmt_tokens(t['cache_read'] + t['cache_write']):>9} "
+                  f"{fmt_tokens(t['total']):>9}")
+        else:
+            if len(name) > 39:
+                name = "…" + name[-38:]
+            bar_len = int((r["minutes"] / max_mins) * 12) if max_mins else 0
+            bar = "█" * bar_len
+            print(f"  {name:<40} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} {r['sessions']:>5}  {bar}")
 
-    print("-" * 78)
-    print(f"  {'TOTAL':<40} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} {grand_sessions:>5}")
+    print("-" * width)
+    if show_tokens:
+        print(f"  {'TOTAL':<30} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} "
+              f"{fmt_tokens(grand_tokens['input']):>8} "
+              f"{fmt_tokens(grand_tokens['output']):>8} "
+              f"{fmt_tokens(grand_tokens['cache_read'] + grand_tokens['cache_write']):>9} "
+              f"{fmt_tokens(grand_tokens['total']):>9}")
+        _print_model_table(grand_tokens)
+    else:
+        print(f"  {'TOTAL':<40} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} {grand_sessions:>5}")
     print()
 
 
@@ -692,28 +1085,35 @@ def _period_window(period):
     return start_today - timedelta(days=6), now, "THIS WEEK (last 7 days)"
 
 
-def analyze_summary(provider, period, idle_threshold, as_json):
+def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False):
     since, until, title = _period_window(period)
-    projects = PROVIDERS[provider]["all"]()
+    if show_tokens:
+        projects = PROVIDERS[provider]["scan"]()
+    else:
+        projects = [(label, ts, []) for label, ts in PROVIDERS[provider]["all"]()]
 
     rows = []
+    all_events = []
     combined_daily = defaultdict(float)
     prompts_per_day = defaultdict(int)
     grand_minutes = 0.0
     grand_prompts = 0
     grand_sessions = 0
 
-    for label, timestamps in projects:
+    for label, timestamps, events in projects:
         timestamps = _filter_timestamps(timestamps, since, until)
         if not timestamps:
             continue
+        events = _filter_events(events, since, until)
         daily, sessions = compute_active_hours(timestamps, idle_threshold)
         rows.append({
             "label": label,
             "minutes": sum(daily.values()),
             "prompts": len(timestamps),
             "sessions": len(sessions),
+            "tokens": summarize_tokens(events) if show_tokens else None,
         })
+        all_events.extend(events)
         for day, mins in daily.items():
             combined_daily[day] += mins
         for ts in timestamps:
@@ -723,33 +1123,40 @@ def analyze_summary(provider, period, idle_threshold, as_json):
         grand_sessions += len(sessions)
 
     rows.sort(key=lambda r: r["minutes"], reverse=True)
+    grand_tokens = summarize_tokens(all_events) if show_tokens else None
+    token_days = tokens_by_day(all_events) if show_tokens else {}
 
     if as_json:
+        projects_json = []
+        for r in rows:
+            entry = {"project": r["label"],
+                     "minutes": round(r["minutes"], 2),
+                     "prompts": r["prompts"],
+                     "sessions": r["sessions"]}
+            if show_tokens:
+                entry["tokens"] = r["tokens"]
+            projects_json.append(entry)
+        totals = {
+            "projects": len(rows),
+            "minutes": round(grand_minutes, 2),
+            "prompts": grand_prompts,
+            "sessions": grand_sessions,
+        }
+        if show_tokens:
+            totals["tokens"] = grand_tokens
         _print_json({
             "provider": provider,
             "period": period,
             "idle_threshold_min": idle_threshold,
             "since": _iso(since),
             "until": _iso(until),
-            "projects": [
-                {"project": r["label"],
-                 "minutes": round(r["minutes"], 2),
-                 "prompts": r["prompts"],
-                 "sessions": r["sessions"]}
-                for r in rows
-            ],
+            "projects": projects_json,
             "days": [
-                {"date": str(day),
-                 "minutes": round(combined_daily[day], 2),
-                 "prompts": prompts_per_day[day]}
-                for day in sorted(combined_daily)
+                _day_entry(day, combined_daily, prompts_per_day,
+                           token_days, show_tokens)
+                for day in _day_keys(combined_daily, token_days)
             ],
-            "totals": {
-                "projects": len(rows),
-                "minutes": round(grand_minutes, 2),
-                "prompts": grand_prompts,
-                "sessions": grand_sessions,
-            },
+            "totals": totals,
         })
         return
 
@@ -764,34 +1171,60 @@ def analyze_summary(provider, period, idle_threshold, as_json):
         return
     print(f"  Active   : {fmt_duration(grand_minutes)} across {len(rows)} project(s)")
     print(f"  Prompts  : {grand_prompts}    Sessions: {grand_sessions}")
+    if show_tokens:
+        print(f"  Tokens   : {fmt_tokens(grand_tokens['total'])} across "
+              f"{grand_tokens['responses']:,} responses")
+        print(f"  In/Out   : {fmt_tokens(grand_tokens['input'])} in · "
+              f"{fmt_tokens(grand_tokens['output'])} out · "
+              f"{fmt_tokens(grand_tokens['cache_read'] + grand_tokens['cache_write'])} cache")
     print("=" * width)
     print()
 
-    print(f"  {'PROJECT':<34} {'TIME':>9} {'PROMPTS':>7}  BAR")
+    if show_tokens:
+        print(f"  {'PROJECT':<30} {'TIME':>9} {'PROMPTS':>7} {'TOKENS':>9}")
+    else:
+        print(f"  {'PROJECT':<34} {'TIME':>9} {'PROMPTS':>7}  BAR")
     print("-" * width)
     max_mins = max(r["minutes"] for r in rows)
     for r in rows:
         name = r["label"]
-        if len(name) > 33:
-            name = "…" + name[-32:]
-        bar = "█" * (int((r["minutes"] / max_mins) * 10) if max_mins else 0)
-        print(f"  {name:<34} {fmt_duration(r['minutes']):>9} {r['prompts']:>7}  {bar}")
+        if show_tokens:
+            if len(name) > 29:
+                name = "…" + name[-28:]
+            print(f"  {name:<30} {fmt_duration(r['minutes']):>9} "
+                  f"{r['prompts']:>7} {fmt_tokens(r['tokens']['total']):>9}")
+        else:
+            if len(name) > 33:
+                name = "…" + name[-32:]
+            bar = "█" * (int((r["minutes"] / max_mins) * 10) if max_mins else 0)
+            print(f"  {name:<34} {fmt_duration(r['minutes']):>9} {r['prompts']:>7}  {bar}")
     print("-" * width)
-    print(f"  {'TOTAL':<34} {fmt_duration(grand_minutes):>9} {grand_prompts:>7}")
+    if show_tokens:
+        print(f"  {'TOTAL':<30} {fmt_duration(grand_minutes):>9} "
+              f"{grand_prompts:>7} {fmt_tokens(grand_tokens['total']):>9}")
+    else:
+        print(f"  {'TOTAL':<34} {fmt_duration(grand_minutes):>9} {grand_prompts:>7}")
 
     if period == "week":
         print()
-        print(f"  {'DAY':<12} {'TIME':>9} {'PROMPTS':>7}  BAR")
+        token_col = f" {'TOKENS':>9}" if show_tokens else ""
+        print(f"  {'DAY':<12} {'TIME':>9} {'PROMPTS':>7}{token_col}  BAR")
         print("-" * width)
         max_day = max(combined_daily.values())
-        for day in sorted(combined_daily):
+        for day in _day_keys(combined_daily, token_days):
             mins = combined_daily[day]
             bar = "█" * (int((mins / max_day) * 10) if max_day else 0)
-            print(f"  {str(day):<12} {fmt_duration(mins):>9} {prompts_per_day[day]:>7}  {bar}")
+            cell = (f" {fmt_tokens(token_days.get(day, {}).get('total', 0)):>9}"
+                    if show_tokens else "")
+            print(f"  {str(day):<12} {fmt_duration(mins):>9} "
+                  f"{prompts_per_day[day]:>7}{cell}  {bar}")
+    if show_tokens:
+        _print_model_table(grand_tokens)
     print()
 
 
-def export_data(provider, idle_threshold, since, until, detail, anonymize):
+def export_data(provider, idle_threshold, since, until, detail, anonymize,
+                show_tokens=False):
     """Emit one versioned JSON bundle of every project for external tools.
 
     Always writes JSON to stdout. `detail` selects granularity:
@@ -809,25 +1242,35 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
     daily, sessions, and prompts. Top-level `provider` is "both" when more than
     one provider contributed; `providers` lists them, and `totals.by_provider`
     breaks the grand totals down per provider.
+
+    With `show_tokens`, every project, day, provider and the grand totals also
+    carry a normalized `tokens` record with a per-model breakdown. The token
+    fields are purely additive — a v2 consumer reads a v3 bundle unchanged.
     """
     out_projects = []
     by_provider = {}
     grand_minutes = 0.0
     grand_prompts = 0
     grand_sessions = 0
+    grand_events = []
     name_counter = 0
 
     for prov in _export_providers(provider):
-        projects = PROVIDERS[prov]["all"]()
+        if show_tokens:
+            projects = PROVIDERS[prov]["scan"]()
+        else:
+            projects = [(label, ts, []) for label, ts in PROVIDERS[prov]["all"]()]
         p_minutes = 0.0
         p_prompts = 0
         p_sessions = 0
         p_projects = 0
+        p_events = []
 
-        for label, timestamps in sorted(projects, key=lambda p: p[0]):
+        for label, timestamps, events in sorted(projects, key=lambda p: p[0]):
             timestamps = _filter_timestamps(timestamps, since, until)
             if not timestamps:
                 continue
+            events = _filter_events(events, since, until)
             daily, _ = compute_active_hours(timestamps, idle_threshold)
             sessions = group_sessions(timestamps, idle_threshold)
             total_minutes = sum(daily.values())
@@ -835,6 +1278,8 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
             prompts_per_day = defaultdict(int)
             for ts in timestamps:
                 prompts_per_day[ts.date()] += 1
+
+            token_days = tokens_by_day(events) if show_tokens else {}
 
             name_counter += 1
             proj = {
@@ -850,12 +1295,12 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
                     "last": int(timestamps[-1].timestamp()),
                 },
                 "daily": [
-                    {"date": str(day),
-                     "minutes": round(daily[day], 2),
-                     "prompts": prompts_per_day[day]}
-                    for day in sorted(daily)
+                    _day_entry(day, daily, prompts_per_day, token_days, show_tokens)
+                    for day in _day_keys(daily, token_days)
                 ],
             }
+            if show_tokens:
+                proj["tokens"] = summarize_tokens(events)
             if not anonymize:
                 proj["path"] = label
             if detail in ("sessions", "raw"):
@@ -874,6 +1319,7 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
             p_minutes += total_minutes
             p_prompts += len(timestamps)
             p_sessions += len(sessions)
+            p_events.extend(events)
 
         if p_projects:
             by_provider[prov] = {
@@ -882,9 +1328,12 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
                 "prompts": p_prompts,
                 "sessions": p_sessions,
             }
+            if show_tokens:
+                by_provider[prov]["tokens"] = summarize_tokens(p_events)
             grand_minutes += p_minutes
             grand_prompts += p_prompts
             grand_sessions += p_sessions
+            grand_events.extend(p_events)
 
     # Report the providers that actually contributed activity; fall back to the
     # requested set so a single-provider export is never emitted with an empty
@@ -893,25 +1342,31 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
     providers = present if present else sorted(_export_providers(provider))
     provider_field = "both" if len(providers) > 1 else providers[0]
 
+    grand_tokens = summarize_tokens(grand_events) if show_tokens else None
+    totals = {
+        "projects": len(out_projects),
+        "minutes": round(grand_minutes, 2),
+        "prompts": grand_prompts,
+        "sessions": grand_sessions,
+        "by_provider": by_provider,
+    }
+    if show_tokens:
+        totals["tokens"] = grand_tokens
+
     _print_json({
-        "schema": "clockwork/v2",
+        "schema": "clockwork/v3",
         "generated_at": datetime.now().astimezone().isoformat(),
         "provider": provider_field,
         "providers": providers,
         "idle_threshold_min": idle_threshold,
         "detail": detail,
         "anonymized": anonymize,
+        "tokens": show_tokens,
         "daily_tz": "UTC",
         "since": _iso(since),
         "until": _iso(until),
         "projects": out_projects,
-        "totals": {
-            "projects": len(out_projects),
-            "minutes": round(grand_minutes, 2),
-            "prompts": grand_prompts,
-            "sessions": grand_sessions,
-            "by_provider": by_provider,
-        },
+        "totals": totals,
     })
 
     # A friendly receipt on stderr — keeps stdout pure JSON for redirection.
@@ -920,11 +1375,17 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize):
     tags = [provider_field, f"detail={detail}"]
     if anonymize:
         tags.append("anonymized")
+    if show_tokens:
+        tags.append("tokens")
     print(f"\n  ✓ export complete → {where}", file=sys.stderr)
     print(f"    {' · '.join(tags)}", file=sys.stderr)
     print(f"    {len(out_projects)} projects · {grand_prompts:,} prompts "
           f"· {grand_sessions:,} sessions · {grand_minutes / 60:.1f}h active",
           file=sys.stderr)
+    if show_tokens:
+        print(f"    {grand_tokens['total']:,} tokens · "
+              f"{grand_tokens['responses']:,} responses · "
+              f"{len(grand_tokens['by_model'])} model(s)", file=sys.stderr)
 
 
 def list_projects(provider, as_json):
@@ -953,7 +1414,7 @@ def _die(msg):
 def _parse_args(argv):
     """Split flags from positionals. Returns (positionals, opts)."""
     opts = {"json": False, "since": None, "until": None,
-            "detail": "raw", "anonymize": False}
+            "detail": "raw", "anonymize": False, "tokens": False}
     positionals = []
     i = 0
     while i < len(argv):
@@ -962,6 +1423,8 @@ def _parse_args(argv):
             opts["json"] = True
         elif a == "--anonymize":
             opts["anonymize"] = True
+        elif a == "--tokens":
+            opts["tokens"] = True
         elif a in ("--since", "--until", "--detail"):
             i += 1
             if i >= len(argv):
@@ -1028,16 +1491,19 @@ def main():
         _die(str(e))
 
     if target == "all":
-        analyze_all(provider, idle_threshold, since, until, opts["json"])
+        analyze_all(provider, idle_threshold, since, until, opts["json"],
+                    opts["tokens"])
     elif target in ("today", "week"):
-        analyze_summary(provider, target, idle_threshold, opts["json"])
+        analyze_summary(provider, target, idle_threshold, opts["json"],
+                        opts["tokens"])
     elif target == "export":
         export_data(provider, idle_threshold, since, until,
-                    opts["detail"], opts["anonymize"])
+                    opts["detail"], opts["anonymize"], opts["tokens"])
     elif target == "list":
         list_projects(provider, opts["json"])
     else:
-        analyze_single(provider, target, idle_threshold, since, until, opts["json"])
+        analyze_single(provider, target, idle_threshold, since, until,
+                       opts["json"], opts["tokens"])
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clockwork-cli"
-version = "0.2.1"
+version = "0.3.0"
 description = "Mine your Claude Code and Codex session logs to estimate active time"
 readme = "README.md"
 license = "MIT"
@@ -28,3 +28,7 @@ clockwork = "clockwork_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Test the working tree, not whatever copy happens to be pip-installed.
+pythonpath = ["src"]
