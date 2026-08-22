@@ -1,13 +1,11 @@
 # Roadmap
 
-Known problems and decisions that outlive a single change.
-
-The proportions quoted below come from one machine, mine, over a couple of
-months of daily use. They are rough, and they will not be your numbers. How far
-off the prompt count runs depends entirely on how tool-heavy your sessions are,
-so a session style built around long autonomous runs will skew much harder than
-one built around conversation. Measure your own logs before acting on any of
-this.
+Known problems and decisions that outlive a single change. The proportions
+quoted below come from one machine, mine, over a couple of months of daily use.
+They are rough, and they will not be your numbers. How far off the prompt count
+runs depends on how tool heavy your sessions are, so a style built around long
+autonomous runs skews much harder than one built around conversation. Measure
+your own logs before acting on any of this.
 
 ---
 
@@ -48,11 +46,12 @@ the export, or meter.
 Filtering tool results out of the timestamp stream also removes them from
 session grouping, and they are what keeps a long autonomous tool run from
 reading as idle. Dropping them from my logs cut total active time by a low
-double-digit percentage and produced *more* sessions, not fewer: runs where
-Claude worked past the idle threshold without human input split at the gap and
-lost the middle.
+double-digit percentage while producing *more* sessions than before: runs
+where Claude worked past the idle threshold without human input split at the
+gap and lost the middle.
 
-The tool-result timestamps are good activity data. They are just not prompts.
+Those timestamps are worth keeping as activity data. The mistake is filing them
+under a label that says a person typed something.
 
 ### Proposed shape
 
@@ -63,7 +62,7 @@ Separate the two concepts the code currently conflates:
 - `prompts`: human-authored messages only, defined the same way on both
   providers, so the number means "things I typed" and lines up with Insights.
 - Optionally keep the raw count as a second field (`turns`, or `events`). It is
-  a reasonable proxy for how tool-heavy a stretch of work was, and it is what
+  a reasonable proxy for how tool heavy a stretch of work was, and it is what
   today's `prompts` field actually measures.
 
 Classification for Claude: a user record is human-authored unless it carries a
@@ -78,7 +77,7 @@ Fixing `prompts` alone leaves a matching defect in place, pointing the other
 way. `_codex_scan_file` builds its timestamp list from `user_message` events
 only, falling back to `response_item` user-role messages; it never reads
 `function_call_output` or `custom_tool_call_output`. Codex activity is
-therefore already prompt-only, which is exactly the state the section above
+therefore already prompt only, which is exactly the state the section above
 rejects for Claude, and for the same reason: a long Codex tool run with no
 human input reads as idle and splits into separate sessions.
 
@@ -86,8 +85,9 @@ That makes `both` mode compare a tool-aware timeline against a prompt-only one,
 so Codex active time is understated relative to Claude by roughly the margin
 that the filtering experiment above measured. Whichever activity definition
 Claude keeps, Codex needs the matching one, which means adding tool-output
-records to its timestamp stream. Different code path, same root confusion, and
-it should ship alongside the prompt work rather than after it.
+records to its timestamp stream. It is a different code path with the same
+underlying confusion behind it, so it belongs in the same piece of work rather
+than a follow-up.
 
 ### Knock-on effects
 
@@ -110,7 +110,7 @@ it should ship alongside the prompt work rather than after it.
 Compare against Claude Code's Insights report (`~/.claude/usage-data/report.html`)
 over a matched date window; the corrected count should land within a few percent.
 Confirm the active-time total is unchanged from the current build, project by
-project. That is the regression that matters most.
+project, since that is the regression most likely to slip through unnoticed.
 
 ---
 
@@ -119,7 +119,7 @@ project. That is the regression that matters most.
 **Decided. Do not "fix" this to match.**
 
 `clockwork --tokens` reports roughly half what Claude Code's `/usage` shows.
-The gap is not an error in either tool. They count different things.
+Neither number is wrong, they just count different things.
 
 Claude Code writes one log line per content block (thinking, text, each
 tool_use), and every line of a single API response repeats the *same* usage
