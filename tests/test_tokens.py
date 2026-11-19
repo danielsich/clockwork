@@ -366,6 +366,20 @@ def test_daily_buckets_sum_to_the_total(claude_log):
     assert sum(d["responses"] for d in daily.values()) == summary["responses"]
 
 
+def test_daily_buckets_carry_a_per_model_split(claude_log):
+    _, events, _ = _claude_scan_files([claude_log])
+    daily = tokens_by_day(events)
+    summary = summarize_tokens(events)
+
+    for day in daily.values():
+        assert sum(m["total"] for m in day["by_model"]) == day["total"]
+    per_model = {}
+    for day in daily.values():
+        for m in day["by_model"]:
+            per_model[m["model"]] = per_model.get(m["model"], 0) + m["total"]
+    assert per_model == {m["model"]: m["total"] for m in summary["by_model"]}
+
+
 def test_events_respect_since_until(claude_log):
     _, events, _ = _claude_scan_files([claude_log])
     cutoff = datetime(2026, 7, 2, tzinfo=timezone.utc)

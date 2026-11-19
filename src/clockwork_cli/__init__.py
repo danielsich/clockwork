@@ -212,11 +212,15 @@ def summarize_tokens(events):
 
 
 def tokens_by_day(events):
-    """Bucket token events into per-day (UTC) sealed records."""
-    daily = defaultdict(_new_token_rec)
+    """Bucket token events into per-day (UTC) summaries, each with `by_model`.
+
+    The per-model split lets a consumer show model usage for any date range
+    by summing the days in it.
+    """
+    daily = defaultdict(list)
     for event in events:
-        _accumulate_tokens(daily[event["ts"].date()], event)
-    return {day: _sealed(rec) for day, rec in daily.items()}
+        daily[event["ts"].date()].append(event)
+    return {day: summarize_tokens(day_events) for day, day_events in daily.items()}
 
 
 def _filter_events(events, since, until):
@@ -1084,7 +1088,7 @@ def _day_entry(day, daily, prompts_per_day, human_per_day, token_days,
              "prompts": prompts_per_day[day],
              "human_prompts": human_per_day[day]}
     if show_tokens:
-        entry["tokens"] = token_days.get(day) or _sealed(_new_token_rec())
+        entry["tokens"] = token_days.get(day) or summarize_tokens([])
     return entry
 
 
