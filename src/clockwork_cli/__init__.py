@@ -76,7 +76,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 def _resolve_claude_dir():
