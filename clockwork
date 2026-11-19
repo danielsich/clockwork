@@ -48,7 +48,7 @@ Examples:
 
 Data sources:
   claude → ~/.claude/projects/<encoded-path>/*.jsonl
-  codex  → $CODEX_HOME/sessions/**/rollout-*.jsonl   (default ~/.codex/sessions)
+  codex  → $CODEX_HOME/sessions/**/rollout-*.jsonl[.zst]   (default ~/.codex/sessions)
 
 Token usage (--tokens):
   Both tools log per-response usage, counted differently, so clockwork
@@ -624,13 +624,79 @@ def claude_list():
 
 
 # --------------------------------------------------------------------------- #
-# Codex backend  ($CODEX_HOME/sessions/**/rollout-*.jsonl)
+# Codex backend  ($CODEX_HOME/sessions/**/rollout-*.jsonl[.zst])
 # --------------------------------------------------------------------------- #
 
 def _codex_files():
+    """Every rollout under $CODEX_HOME/sessions, plain or zstd-compressed.
+
+    Newer Codex versions save finished rollouts as `rollout-*.jsonl.zst`.
+    If a rollout exists in both forms, the newer file wins so it is counted
+    once.
+    """
     codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
-    pattern = os.path.join(codex_home, "sessions", "**", "rollout-*.jsonl")
-    return glob.glob(pattern, recursive=True)
+    root = os.path.join(codex_home, "sessions", "**")
+    found = {}
+    for pattern in ("rollout-*.jsonl", "rollout-*.jsonl.zst"):
+        for f in glob.glob(os.path.join(root, pattern), recursive=True):
+            key = f[:-4] if f.endswith(".zst") else f
+            prev = found.get(key)
+            if prev is None or _mtime(f) > _mtime(prev):
+                found[key] = f
+    return sorted(found.values())
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def _zstd_decompress(data):
+    """Decompress zstd bytes with whatever is available.
+
+    Python 3.14 ships `compression.zstd`; otherwise try the `zstandard`
+    package, then the `zstd` command-line tool.
+    """
+    try:
+        from compression import zstd
+        return zstd.decompress(data)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+    except ImportError:
+        pass
+    import subprocess
+    try:
+        return subprocess.run(["zstd", "-dc"], input=data, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise OSError("cannot decompress zstd file (needs Python 3.14+, "
+                      "the zstandard package, or the zstd tool)") from e
+
+
+_zstd_warned = False
+
+
+def _open_log(path):
+    """Open a JSONL log for text reading, decompressing `.zst` files."""
+    global _zstd_warned
+    if not path.endswith(".zst"):
+        return open(path, encoding="utf-8")
+    import io
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        data = _zstd_decompress(raw)
+    except OSError as e:
+        if not _zstd_warned:
+            _zstd_warned = True
+            print("clockwork: skipping .zst Codex logs: %s" % e, file=sys.stderr)
+        raise
+    return io.StringIO(data.decode("utf-8", errors="replace"))
 
 
 _CODEX_TOKEN_KEYS = ("input_tokens", "cached_input_tokens",
@@ -708,7 +774,7 @@ def _codex_scan_file(path):
     first_model = None
     running = {k: 0 for k in _CODEX_TOKEN_KEYS}
     try:
-        with open(path, encoding="utf-8") as fh:
+        with _open_log(path) as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -810,7 +876,7 @@ def _codex_cwd_only(path):
     the `session_meta` record carrying `cwd` is at the top of the rollout.
     """
     try:
-        with open(path, encoding="utf-8") as fh:
+        with _open_log(path) as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
