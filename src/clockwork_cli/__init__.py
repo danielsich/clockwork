@@ -55,8 +55,10 @@ Token usage (--tokens):
 
   claude → `assistant` records carry message.model + message.usage. One API
            response spans several lines (thinking, text, each tool_use), each
-           repeating the same usage block, so responses are deduplicated on
-           message id. Cache reads/writes sit outside input_tokens.
+           repeating its usage block, so responses are deduplicated on
+           message id, keeping the final (largest) count per field.
+           Subagent logs (<session>/subagents/*.jsonl) are included. Cache
+           reads/writes sit outside input_tokens.
   codex  → `event_msg -> token_count` records carry a cumulative
            total_token_usage; per-turn cost is read as the rise in that counter
            because last_token_usage is re-emitted on aborted turns. The model
@@ -358,25 +360,52 @@ def path_to_claude_folder(project_path):
     return folder_name
 
 
+def _claude_session_files(folder_dir):
+    """Return ([session logs], [subagent logs]) for one Claude project folder.
+
+    Subagent transcripts are not part of the session log: Claude Code writes
+    them beside it, under `<session-id>/subagents/agent-*.jsonl`.
+    """
+    sessions = glob.glob(os.path.join(folder_dir, "*.jsonl"))
+    subagents = glob.glob(os.path.join(folder_dir, "*", "subagents", "*.jsonl"))
+    return sessions, subagents
+
+
 def _claude_resolve_files(project_path):
-    """Return (folder_name, [files]) for a project path, or (None, [])."""
+    """Return (folder_name, [session logs], [subagent logs]) for a project
+    path, or (None, [], [])."""
     folder = path_to_claude_folder(project_path)
     # Claude Code retains the leading dash from the absolute path, so try both
     # the dash-prefixed and stripped forms to match whichever convention exists.
     for candidate in ("-" + folder, folder):
-        files = glob.glob(os.path.join(CLAUDE_DIR, candidate, "*.jsonl"))
+        files, subagents = _claude_session_files(os.path.join(CLAUDE_DIR, candidate))
         if files:
-            return candidate, files
-    return None, []
+            return candidate, files, subagents
+    return None, [], []
+
+
+_CLAUDE_USAGE_FIELDS = (
+    ("input", "input_tokens"),
+    ("output", "output_tokens"),
+    ("cache_read", "cache_read_input_tokens"),
+    ("cache_write", "cache_creation_input_tokens"),
+)
 
 
 def _claude_token_event(record, dt, seen):
     """Normalize one Claude assistant record into a token event, or None.
 
     Claude Code writes one line per content block — thinking, text, and each
-    tool_use — and every line of a single API response repeats the *identical*
-    usage object. Counting per line inflates totals roughly 2.6x, so responses
-    are deduplicated on the message id (falling back to the request id).
+    tool_use — and every line repeats the usage of the whole API response.
+    Counting per line inflates totals roughly 2.6x, so responses are
+    deduplicated on the message id (falling back to the request id).
+
+    The repeated usage is not always identical: subagent logs write the first
+    line while the response is still streaming (`output_tokens: 3`) and only
+    the last line carries the final count. So a repeat is folded into the
+    event already recorded, keeping the larger value per field. Main-thread
+    lines are identical, so for them this is the same as keeping the first.
+    `seen` maps each key to the event recorded for it.
     """
     message = record.get("message") or {}
     usage = message.get("usage")
@@ -385,34 +414,40 @@ def _claude_token_event(record, dt, seen):
     # they carry a zero usage block and never hit the API.
     if not usage or not model or model == "<synthetic>" or dt is None:
         return None
+    event = {"ts": dt, "model": model}
+    for field, usage_key in _CLAUDE_USAGE_FIELDS:
+        event[field] = usage.get(usage_key) or 0
+    event["reasoning"] = 0  # Claude folds thinking into output_tokens
     key = message.get("id") or record.get("requestId")
     if key is not None:
-        if key in seen:
+        prior = seen.get(key)
+        if prior is not None:
+            for field, _ in _CLAUDE_USAGE_FIELDS:
+                prior[field] = max(prior[field], event[field])
             return None
-        seen.add(key)
-    return {
-        "ts": dt,
-        "model": model,
-        "input": usage.get("input_tokens") or 0,
-        "output": usage.get("output_tokens") or 0,
-        "cache_read": usage.get("cache_read_input_tokens") or 0,
-        "cache_write": usage.get("cache_creation_input_tokens") or 0,
-        "reasoning": 0,  # Claude folds thinking into output_tokens
-    }
+        seen[key] = event
+    return event
 
 
-def _claude_scan_files(files):
+def _claude_scan_files(files, subagent_files=()):
     """Return (prompt timestamps, token events) from Claude .jsonl files.
 
     Both come out of a single pass: the files are already read end to end for
-    the timestamps, so picking up usage costs nothing extra. The dedup set is
+    the timestamps, so picking up usage costs nothing extra. The dedup map is
     shared across the whole file list so a response replayed into a resumed
     session's log is still only counted once.
+
+    `subagent_files` contribute token events only. Their user-role records are
+    the parent's task prompt plus tool results, none of it typed by a person,
+    so adding them to the timestamps would inflate `prompts` further (see
+    ROADMAP §1, which is where subagent activity belongs).
     """
     timestamps = []
     events = []
-    seen = set()
-    for f in sorted(files):
+    seen = {}
+    sources = [(f, True) for f in sorted(files)]
+    sources += [(f, False) for f in sorted(subagent_files)]
+    for f, count_prompts in sources:
         with open(f, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -425,7 +460,8 @@ def _claude_scan_files(files):
                 role = d.get("role") or d.get("type", "")
                 dt = _parse_ts(d.get("timestamp"))
                 if dt and role in ("human", "user"):
-                    timestamps.append(dt)
+                    if count_prompts:
+                        timestamps.append(dt)
                 elif role == "assistant":
                     event = _claude_token_event(d, dt, seen)
                     if event:
@@ -446,10 +482,10 @@ def _claude_folder_to_pretty(folder):
 
 
 def claude_scan_single(project_path):
-    folder, files = _claude_resolve_files(project_path)
+    folder, files, subagents = _claude_resolve_files(project_path)
     if not files:
         return None, 0, [], []
-    ts, events = _claude_scan_files(files)
+    ts, events = _claude_scan_files(files, subagents)
     return folder, len(files), ts, events
 
 
@@ -461,8 +497,8 @@ def claude_single(project_path):
 def claude_scan():
     result = []
     for folder in _claude_list_folders():
-        files = glob.glob(os.path.join(CLAUDE_DIR, folder, "*.jsonl"))
-        ts, events = _claude_scan_files(files)
+        files, subagents = _claude_session_files(os.path.join(CLAUDE_DIR, folder))
+        ts, events = _claude_scan_files(files, subagents)
         if ts:
             result.append((_claude_folder_to_pretty(folder), ts, events))
     return result

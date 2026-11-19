@@ -234,9 +234,11 @@ Two counting traps are handled for you, both of which inflate the numbers if
 you read the logs naively:
 
 - **Claude** writes one line per content block — thinking, text, and each tool
-  call — and every line of a single API response repeats the *identical* usage
-  block. Counting per line overstates usage roughly 2.6x, so responses are
-  deduplicated on their message id.
+  call — and every line of a single API response repeats its usage block.
+  Counting per line overstates usage roughly 2.6x, so responses are
+  deduplicated on their message id. Subagent transcripts
+  (`<session>/subagents/*.jsonl`) are read too; there the first line of a
+  response holds a streaming partial, so the largest count per field wins.
 - **Codex** re-emits a stale `last_token_usage` on aborted and no-op turns that
   its cumulative counter never absorbs, so a turn's real cost is read as the
   rise in `total_token_usage` instead. The model name comes from the preceding

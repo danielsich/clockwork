@@ -121,6 +121,40 @@ def test_claude_dedup_spans_files(tmp_path):
     assert len(events) == 1
 
 
+def test_claude_subagent_keeps_final_usage_not_streaming_partial(tmp_path):
+    """Subagent logs write a response's first line mid-stream.
+
+    The first line's usage carries a partial output count; only the last line
+    holds the final figure. Keeping the first would undercount output badly.
+    """
+    ts = "2026-07-01T10:00:00.000Z"
+    partial = dict(CLAUDE_USAGE_1, output_tokens=3)
+    sub = write_jsonl(tmp_path / "agent-1.jsonl", [
+        {"type": "user", "timestamp": "2026-07-01T09:59:00.000Z"},
+        claude_assistant("msg_s", "claude-haiku-5", ts, partial, "thinking"),
+        claude_assistant("msg_s", "claude-haiku-5", ts, CLAUDE_USAGE_1, "tool_use"),
+    ])
+    _, events = _claude_scan_files([], [sub])
+
+    assert len(events) == 1
+    assert events[0]["output"] == 100
+    assert events[0]["model"] == "claude-haiku-5"
+
+
+def test_claude_subagent_records_add_tokens_but_not_prompts(claude_log, tmp_path):
+    sub = write_jsonl(tmp_path / "agent-1.jsonl", [
+        {"type": "user", "timestamp": "2026-07-01T10:01:00.000Z"},
+        {"type": "user", "timestamp": "2026-07-01T10:02:00.000Z"},
+        claude_assistant("msg_s", "claude-haiku-5",
+                         "2026-07-01T10:01:30.000Z", CLAUDE_USAGE_2),
+    ])
+    timestamps, events = _claude_scan_files([claude_log], [sub])
+
+    assert len(timestamps) == 2  # only the main session's two user turns
+    assert [e["model"] for e in events] == [
+        "claude-opus-5", "claude-sonnet-5", "claude-haiku-5"]
+
+
 # --------------------------------------------------------------------------- #
 # Codex
 # --------------------------------------------------------------------------- #

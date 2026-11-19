@@ -84,6 +84,11 @@ therefore already prompt only, which is exactly the state the section above
 rejects for Claude, and for the same reason: a long Codex tool run with no
 human input reads as idle and splits into separate sessions.
 
+Claude subagent transcripts (`<session>/subagents/*.jsonl`) sit in the same
+gap. They are read for tokens only, since their user-role records are task
+prompts and tool results; their timestamps belong in the activity stream once
+it is separated from `prompts`.
+
 That makes `both` mode compare a tool-aware timeline against a prompt-only one,
 so Codex active time is understated relative to Claude by roughly the margin
 that the filtering experiment above measured. Whichever activity definition
@@ -133,7 +138,10 @@ by roughly two to one.
 
 Summing per line reproduces `/usage` almost exactly, down to matching per-model
 figures. Counting once per `message.id` gives clockwork's number
-(`clockwork:386`). The API bills per request, so the deduplicated figure is the
+(`_claude_token_event`). That identical-usage observation holds for main
+session logs only. Subagent logs write a response's first line mid-stream with
+a partial output count, so the dedup keeps the largest value per field rather
+than the first line. The API bills per request, so the deduplicated figure is the
 true count of tokens processed. `by_model` and tokens-per-response follow from
 that.
 
