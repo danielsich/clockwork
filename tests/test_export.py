@@ -26,11 +26,17 @@ def run_export(monkeypatch, capsys, provider, claude=None, codex=None,
 
     Both the timing-only (`all`) and token-aware (`scan`) backends are stubbed,
     so the same fixtures drive an export with or without --tokens. Fixtures may
-    be (path, timestamps) pairs or (path, timestamps, token events) triples.
+    be (path, timestamps) pairs, (path, timestamps, token events) triples, or
+    (path, timestamps, token events, human timestamps). Without the fourth
+    element every timestamp is treated as a human prompt.
     """
     def split(projects):
-        rows = [p if len(p) == 3 else (p[0], p[1], []) for p in (projects or [])]
-        return ([(label, ts) for label, ts, _ in rows], rows)
+        rows = []
+        for p in projects or []:
+            events = p[2] if len(p) > 2 else []
+            human = p[3] if len(p) > 3 else p[1]
+            rows.append((p[0], p[1], events, human))
+        return ([(label, ts, human) for label, ts, _, human in rows], rows)
 
     claude_all, claude_scan = split(claude)
     codex_all, codex_scan = split(codex)

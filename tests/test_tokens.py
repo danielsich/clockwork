@@ -78,7 +78,7 @@ def claude_log(tmp_path):
 
 
 def test_claude_counts_each_response_once(claude_log):
-    _, events = _claude_scan_files([claude_log])
+    _, events, _ = _claude_scan_files([claude_log])
 
     # Three lines for msg_1 plus one for msg_2 — two API responses.
     assert len(events) == 2
@@ -86,7 +86,7 @@ def test_claude_counts_each_response_once(claude_log):
 
 
 def test_claude_maps_cache_fields_and_leaves_input_alone(claude_log):
-    _, events = _claude_scan_files([claude_log])
+    _, events, _ = _claude_scan_files([claude_log])
     first = events[0]
 
     # Claude reports cache reads/writes *outside* input_tokens, so input passes
@@ -99,12 +99,12 @@ def test_claude_maps_cache_fields_and_leaves_input_alone(claude_log):
 
 
 def test_claude_skips_synthetic_and_usageless_records(claude_log):
-    _, events = _claude_scan_files([claude_log])
+    _, events, _ = _claude_scan_files([claude_log])
     assert all(e["model"] not in ("<synthetic>", None) for e in events)
 
 
 def test_claude_prompts_still_parsed_alongside_tokens(claude_log):
-    timestamps, _ = _claude_scan_files([claude_log])
+    timestamps, _, _ = _claude_scan_files([claude_log])
     assert len(timestamps) == 2  # the two user turns, assistants excluded
 
 
@@ -117,7 +117,7 @@ def test_claude_dedup_spans_files(tmp_path):
     b = write_jsonl(tmp_path / "b.jsonl",
                     [claude_assistant("msg_1", "claude-opus-5",
                                       "2026-07-01T10:00:00.000Z", usage)])
-    _, events = _claude_scan_files([a, b])
+    _, events, _ = _claude_scan_files([a, b])
     assert len(events) == 1
 
 
@@ -134,7 +134,7 @@ def test_claude_subagent_keeps_final_usage_not_streaming_partial(tmp_path):
         claude_assistant("msg_s", "claude-haiku-5", ts, partial, "thinking"),
         claude_assistant("msg_s", "claude-haiku-5", ts, CLAUDE_USAGE_1, "tool_use"),
     ])
-    _, events = _claude_scan_files([], [sub])
+    _, events, _ = _claude_scan_files([], [sub])
 
     assert len(events) == 1
     assert events[0]["output"] == 100
@@ -148,7 +148,7 @@ def test_claude_subagent_records_add_tokens_but_not_prompts(claude_log, tmp_path
         claude_assistant("msg_s", "claude-haiku-5",
                          "2026-07-01T10:01:30.000Z", CLAUDE_USAGE_2),
     ])
-    timestamps, events = _claude_scan_files([claude_log], [sub])
+    timestamps, events, _ = _claude_scan_files([claude_log], [sub])
 
     assert len(timestamps) == 2  # only the main session's two user turns
     assert [e["model"] for e in events] == [
@@ -302,7 +302,7 @@ def test_summary_reconciles_with_per_model_breakdown(codex_log):
 
 
 def test_daily_buckets_sum_to_the_total(claude_log):
-    _, events = _claude_scan_files([claude_log])
+    _, events, _ = _claude_scan_files([claude_log])
     daily = tokens_by_day(events)
     summary = summarize_tokens(events)
 
@@ -312,7 +312,7 @@ def test_daily_buckets_sum_to_the_total(claude_log):
 
 
 def test_events_respect_since_until(claude_log):
-    _, events = _claude_scan_files([claude_log])
+    _, events, _ = _claude_scan_files([claude_log])
     cutoff = datetime(2026, 7, 2, tzinfo=timezone.utc)
 
     assert len(_filter_events(events, cutoff, None)) == 1

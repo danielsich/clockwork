@@ -72,6 +72,7 @@ import json
 import os
 import re
 import glob
+import bisect
 import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -438,25 +439,90 @@ def _claude_token_event(record, dt, seen):
     return event
 
 
-def _claude_scan_files(files, subagent_files=()):
-    """Return (prompt timestamps, token events) from Claude .jsonl files.
+# Leading text of user-role records that Claude Code writes on the user's
+# behalf rather than from anything sent as a prompt: local slash-command
+# echoes and output (/model, /clear), `!` shell input and output, background
+# task notifications, and interrupt markers. Skill-style commands that do go
+# to the model start with `<command-message>` instead and are kept.
+_CLAUDE_NOT_TYPED_PREFIXES = (
+    "<command-name>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<task-notification>",
+    "<system-reminder>",
+    "[Request interrupted by user",
+)
 
-    Both come out of a single pass: the files are already read end to end for
-    the timestamps, so picking up usage costs nothing extra. The dedup map is
-    shared across the whole file list so a response replayed into a resumed
+
+def _claude_is_typed_text(text):
+    text = (text or "").lstrip()
+    return bool(text) and not text.startswith(_CLAUDE_NOT_TYPED_PREFIXES)
+
+
+def _claude_is_human_prompt(record):
+    """True when a user-role record is a message a person sent.
+
+    Most user-role records are not: the API returns every tool result to the
+    model as a user message, and Claude Code also logs injected context and
+    command output under the same role. Newer logs tag real input with
+    `origin.kind == "human"`, and that tag is trusted wherever it is present.
+    Records without an `origin` (older logs, and some newer ones) are
+    classified by shape instead.
+
+    One shape needs care: a message typed while a tool is running is folded
+    into that tool's result record as an extra text block. So a tool result
+    alone is not a prompt, but a tool result carrying typed text is.
+    """
+    origin = record.get("origin")
+    if isinstance(origin, dict) and origin.get("kind"):
+        return origin["kind"] == "human"
+    if record.get("isMeta") or record.get("isCompactSummary"):
+        return False
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return _claude_is_typed_text(content)
+    if not isinstance(content, list):
+        return False
+    blocks = [b for b in content if isinstance(b, dict)]
+    texts = [b.get("text") for b in blocks if b.get("type") == "text"]
+    if any(_claude_is_typed_text(t) for t in texts):
+        return True
+    # No typed text: an image pasted on its own still counts; a bare tool
+    # result or a wrapper-only record does not.
+    has_tool_result = any(b.get("type") == "tool_result" for b in blocks)
+    return not texts and not has_tool_result and bool(blocks)
+
+
+def _claude_scan_files(files, subagent_files=()):
+    """Return (activity timestamps, token events, human prompt timestamps)
+    from Claude .jsonl files.
+
+    Activity is every user-role record, tool results included. Those are what
+    show Claude working through a long autonomous run, so session grouping and
+    active time are built on them. Human prompts are the subset a person
+    actually sent (`_claude_is_human_prompt`), deduplicated on record uuid
+    because a resumed session replays earlier messages into its new log.
+
+    Everything comes out of a single pass. The token dedup map is shared
+    across the whole file list so a response replayed into a resumed
     session's log is still only counted once.
 
     `subagent_files` contribute token events only. Their user-role records are
-    the parent's task prompt plus tool results, none of it typed by a person,
-    so adding them to the timestamps would inflate `prompts` further (see
-    ROADMAP §1, which is where subagent activity belongs).
+    the parent's task prompt plus tool results, none of it typed by a person
+    (see ROADMAP §1, which is where subagent activity belongs).
     """
     timestamps = []
+    human = []
     events = []
     seen = {}
+    seen_prompts = set()
     sources = [(f, True) for f in sorted(files)]
     sources += [(f, False) for f in sorted(subagent_files)]
-    for f, count_prompts in sources:
+    for f, is_session in sources:
         with open(f, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -469,18 +535,19 @@ def _claude_scan_files(files, subagent_files=()):
                 role = d.get("role") or d.get("type", "")
                 dt = _parse_ts(d.get("timestamp"))
                 if dt and role in ("human", "user"):
-                    if count_prompts:
-                        timestamps.append(dt)
+                    if not is_session:
+                        continue
+                    timestamps.append(dt)
+                    if _claude_is_human_prompt(d):
+                        uid = d.get("uuid")
+                        if uid is None or uid not in seen_prompts:
+                            seen_prompts.add(uid)
+                            human.append(dt)
                 elif role == "assistant":
                     event = _claude_token_event(d, dt, seen)
                     if event:
                         events.append(event)
-    return sorted(timestamps), events
-
-
-def _claude_timestamps_from_files(files):
-    """Parse user/human turn timestamps from Claude .jsonl files."""
-    return _claude_scan_files(files)[0]
+    return sorted(timestamps), events, sorted(human)
 
 
 def _claude_folder_to_pretty(folder):
@@ -520,28 +587,28 @@ def _claude_folder_cwd(folder, files):
 def claude_scan_single(project_path):
     folder, files, subagents = _claude_resolve_files(project_path)
     if not files:
-        return None, 0, [], []
-    ts, events = _claude_scan_files(files, subagents)
-    return folder, len(files), ts, events
+        return None, 0, [], [], []
+    ts, events, human = _claude_scan_files(files, subagents)
+    return folder, len(files), ts, events, human
 
 
 def claude_single(project_path):
-    folder, count, ts, _ = claude_scan_single(project_path)
-    return folder, count, ts
+    folder, count, ts, _, human = claude_scan_single(project_path)
+    return folder, count, ts, human
 
 
 def claude_scan():
     result = []
     for folder in _claude_list_folders():
         files, subagents = _claude_session_files(os.path.join(CLAUDE_DIR, folder))
-        ts, events = _claude_scan_files(files, subagents)
+        ts, events, human = _claude_scan_files(files, subagents)
         if ts:
-            result.append((_claude_folder_cwd(folder, files), ts, events))
+            result.append((_claude_folder_cwd(folder, files), ts, events, human))
     return result
 
 
 def claude_all():
-    return [(label, ts) for label, ts, _ in claude_scan()]
+    return [(label, ts, human) for label, ts, _, human in claude_scan()]
 
 
 def _claude_list_folders():
@@ -698,13 +765,16 @@ def codex_scan_single(project_path):
             timestamps.extend(file_ts)
             events.extend(file_events)
     if not matched:
-        return None, 0, [], []
-    return abs_path, matched, sorted(timestamps), events
+        return None, 0, [], [], []
+    # Codex prompts are already the messages a person sent (tool output is
+    # logged under other record types), so the human stream is the same list.
+    timestamps.sort()
+    return abs_path, matched, timestamps, events, timestamps
 
 
 def codex_single(project_path):
-    label, count, ts, _ = codex_scan_single(project_path)
-    return label, count, ts
+    label, count, ts, _, human = codex_scan_single(project_path)
+    return label, count, ts, human
 
 
 def codex_scan():
@@ -715,11 +785,15 @@ def codex_scan():
         if cwd and file_ts:
             ts_groups[cwd].extend(file_ts)
             event_groups[cwd].extend(file_events)
-    return [(cwd, sorted(ts), event_groups[cwd]) for cwd, ts in ts_groups.items()]
+    result = []
+    for cwd, ts in ts_groups.items():
+        ts.sort()
+        result.append((cwd, ts, event_groups[cwd], ts))  # human == activity
+    return result
 
 
 def codex_all():
-    return [(label, ts) for label, ts, _ in codex_scan()]
+    return [(label, ts, human) for label, ts, _, human in codex_scan()]
 
 
 def _codex_cwd_only(path):
@@ -759,38 +833,45 @@ def codex_list():
 # --------------------------------------------------------------------------- #
 
 def _merge_projects(*project_lists):
-    """Merge [(label, timestamps)] lists, combining same-label projects."""
-    groups = defaultdict(list)
+    """Merge [(label, timestamps, human)] lists, combining same-label projects."""
+    ts_groups = defaultdict(list)
+    human_groups = defaultdict(list)
     for projects in project_lists:
-        for label, ts in projects:
-            groups[label].extend(ts)
-    return [(label, sorted(ts)) for label, ts in groups.items()]
+        for label, ts, human in projects:
+            ts_groups[label].extend(ts)
+            human_groups[label].extend(human)
+    return [(label, sorted(ts), sorted(human_groups[label]))
+            for label, ts in ts_groups.items()]
 
 
 def _merge_scans(*scans):
-    """Merge [(label, timestamps, events)] lists, combining same-label projects."""
+    """Merge [(label, timestamps, events, human)] lists, combining same-label
+    projects."""
     ts_groups = defaultdict(list)
     event_groups = defaultdict(list)
+    human_groups = defaultdict(list)
     for scan in scans:
-        for label, ts, events in scan:
+        for label, ts, events, human in scan:
             ts_groups[label].extend(ts)
             event_groups[label].extend(events)
-    return [(label, sorted(ts), event_groups[label])
+            human_groups[label].extend(human)
+    return [(label, sorted(ts), event_groups[label], sorted(human_groups[label]))
             for label, ts in ts_groups.items()]
 
 
 def both_scan_single(project_path):
-    _, c_count, c_ts, c_events = claude_scan_single(project_path)
-    _, x_count, x_ts, x_events = codex_scan_single(project_path)
+    _, c_count, c_ts, c_events, c_human = claude_scan_single(project_path)
+    _, x_count, x_ts, x_events, x_human = codex_scan_single(project_path)
     count = c_count + x_count
     if count == 0:
-        return None, 0, [], []
-    return project_path, count, sorted(c_ts + x_ts), c_events + x_events
+        return None, 0, [], [], []
+    return (project_path, count, sorted(c_ts + x_ts), c_events + x_events,
+            sorted(c_human + x_human))
 
 
 def both_single(project_path):
-    label, count, ts, _ = both_scan_single(project_path)
-    return label, count, ts
+    label, count, ts, _, human = both_scan_single(project_path)
+    return label, count, ts, human
 
 
 def both_scan():
@@ -814,6 +895,15 @@ def both_list():
 # Provider dispatch
 # --------------------------------------------------------------------------- #
 
+# Every backend returns two timestamp lists per project: activity (every
+# user-role record, which drives sessions and active time) and human (the
+# messages a person sent, which is what the `human_prompts` count reports).
+#
+#   single(path)      → (label, files, activity, human)
+#   scan_single(path) → (label, files, activity, events, human)
+#   all()             → [(label, activity, human)]
+#   scan()            → [(label, activity, events, human)]
+#
 # `scan`/`scan_single` are the token-aware backends: same work as `all`/`single`
 # plus the usage records picked up in the same pass. `all`/`single` remain the
 # timing-only views, and are what the plain (no --tokens) commands read.
@@ -876,11 +966,48 @@ def _day_keys(daily, token_days):
     return sorted(set(daily) | set(token_days))
 
 
-def _day_entry(day, daily, prompts_per_day, token_days, show_tokens):
-    """One JSON day bucket, with tokens attached when they were collected."""
+def _load_projects(provider, show_tokens):
+    """[(label, activity, events, human)] for every project of a provider.
+
+    Reads the token-aware backend only when tokens were asked for; the plain
+    backend is the same scan without usage, so `events` is empty.
+    """
+    if show_tokens:
+        return PROVIDERS[provider]["scan"]()
+    return [(label, ts, [], human)
+            for label, ts, human in PROVIDERS[provider]["all"]()]
+
+
+def _per_day(timestamps):
+    """Count timestamps per calendar day."""
+    counts = defaultdict(int)
+    for ts in timestamps:
+        counts[ts.date()] += 1
+    return counts
+
+
+def _human_per_session(sessions, human):
+    """Human prompts inside each (start, end, count) session, in order.
+
+    Every human prompt is also an activity timestamp, so each one falls inside
+    exactly one session's [start, end].
+    """
+    return [bisect.bisect_right(human, end) - bisect.bisect_left(human, start)
+            for start, end, _ in sessions]
+
+
+def _day_entry(day, daily, prompts_per_day, human_per_day, token_days,
+               show_tokens):
+    """One JSON day bucket, with tokens attached when they were collected.
+
+    `prompts` keeps its original meaning (every user-role record, tool results
+    included) so existing consumers are unaffected; `human_prompts` is the
+    count of messages a person sent.
+    """
     entry = {"date": str(day),
              "minutes": round(daily[day], 2),
-             "prompts": prompts_per_day[day]}
+             "prompts": prompts_per_day[day],
+             "human_prompts": human_per_day[day]}
     if show_tokens:
         entry["tokens"] = token_days.get(day) or _sealed(_new_token_rec())
     return entry
@@ -924,18 +1051,21 @@ def _print_model_table(summary):
 def analyze_single(provider, project_path, idle_threshold, since, until, as_json,
                    show_tokens=False):
     if show_tokens:
-        label, count, timestamps, events = PROVIDERS[provider]["scan_single"](project_path)
+        label, count, timestamps, events, human = \
+            PROVIDERS[provider]["scan_single"](project_path)
         events = _filter_events(events, since, until)
     else:
-        label, count, timestamps = PROVIDERS[provider]["single"](project_path)
+        label, count, timestamps, human = PROVIDERS[provider]["single"](project_path)
         events = []
     timestamps = _filter_timestamps(timestamps, since, until)
+    human = _filter_timestamps(human, since, until)
 
     if count == 0:
         if as_json:
             _print_json({
                 "provider": provider, "project": project_path,
-                "error": "no sessions found", "prompts": 0, "days": [],
+                "error": "no sessions found", "prompts": 0,
+                "human_prompts": 0, "days": [],
             })
             sys.exit(1)
         print(f"❌ No {provider} sessions found for: {project_path}")
@@ -951,7 +1081,7 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
             _print_json({
                 "provider": provider, "project": project_path, "label": label,
                 "session_files": count, "since": _iso(since), "until": _iso(until),
-                "prompts": 0, "days": [],
+                "prompts": 0, "human_prompts": 0, "days": [],
             })
             sys.exit(0)
         print("No user prompts found in the selected range.")
@@ -964,9 +1094,8 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
     last_ts = timestamps[-1]
     span_days = (last_ts.date() - first_ts.date()).days + 1
 
-    prompts_per_day = defaultdict(int)
-    for ts in timestamps:
-        prompts_per_day[ts.date()] += 1
+    prompts_per_day = _per_day(timestamps)
+    human_per_day = _per_day(human)
 
     token_summary = summarize_tokens(events) if show_tokens else None
     token_days = tokens_by_day(events) if show_tokens else {}
@@ -984,11 +1113,13 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
             "last": _iso(last_ts),
             "span_days": span_days,
             "prompts": len(timestamps),
+            "human_prompts": len(human),
             "sessions": len(sessions),
             "active_days": len(daily),
             "total_minutes": round(total_minutes, 2),
             "days": [
-                _day_entry(day, daily, prompts_per_day, token_days, show_tokens)
+                _day_entry(day, daily, prompts_per_day, human_per_day,
+                           token_days, show_tokens)
                 for day in _day_keys(daily, token_days)
             ],
         }
@@ -1006,7 +1137,7 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
     print(f"  First   : {first_ts.strftime('%Y-%m-%d %H:%M')}")
     print(f"  Last    : {last_ts.strftime('%Y-%m-%d %H:%M')}")
     print(f"  Span    : {span_days} calendar days")
-    print(f"  Prompts : {len(timestamps)} total")
+    print(f"  Prompts : {len(human)} total")
     print(f"  Sessions: {len(sessions)} (idle threshold: {idle_threshold} min)")
     print(f"  Active  : {len(daily)} days")
     print(f"  Total   : {fmt_duration(total_minutes)}")
@@ -1026,13 +1157,13 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
         cell = (f" {fmt_tokens(token_days.get(day, {}).get('total', 0)):>9}"
                 if show_tokens else "")
         print(f"  {str(day):<12} {fmt_duration(mins):<14} "
-              f"{prompts_per_day[day]:<10}{cell} {bar}")
+              f"{human_per_day[day]:<10}{cell} {bar}")
 
     print("-" * (52 + len(token_col)))
     total_cell = f" {fmt_tokens(token_summary['total']):>9}" if show_tokens else ""
     # rstrip so the plain (no --tokens) row keeps its original width.
     print(f"  {'TOTAL':<12} {fmt_duration(total_minutes):<14} "
-          f"{len(timestamps):<10}{total_cell}".rstrip())
+          f"{len(human):<10}{total_cell}".rstrip())
     if show_tokens:
         _print_model_table(token_summary)
     print()
@@ -1040,21 +1171,20 @@ def analyze_single(provider, project_path, idle_threshold, since, until, as_json
 
 def analyze_all(provider, idle_threshold, since, until, as_json,
                 show_tokens=False):
-    if show_tokens:
-        projects = PROVIDERS[provider]["scan"]()
-    else:
-        projects = [(label, ts, []) for label, ts in PROVIDERS[provider]["all"]()]
+    projects = _load_projects(provider, show_tokens)
 
     rows = []
     all_events = []
     grand_minutes = 0.0
     grand_prompts = 0
+    grand_human = 0
     grand_sessions = 0
 
-    for label, timestamps, events in projects:
+    for label, timestamps, events, human in projects:
         timestamps = _filter_timestamps(timestamps, since, until)
         if not timestamps:
             continue
+        human = _filter_timestamps(human, since, until)
         events = _filter_events(events, since, until)
         daily, sessions = compute_active_hours(timestamps, idle_threshold)
         total_minutes = sum(daily.values())
@@ -1062,12 +1192,14 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
             "label": label,
             "minutes": total_minutes,
             "prompts": len(timestamps),
+            "human_prompts": len(human),
             "sessions": len(sessions),
             "tokens": summarize_tokens(events) if show_tokens else None,
         })
         all_events.extend(events)
         grand_minutes += total_minutes
         grand_prompts += len(timestamps)
+        grand_human += len(human)
         grand_sessions += len(sessions)
 
     if not rows:
@@ -1075,7 +1207,8 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
             _print_json({
                 "provider": provider, "since": _iso(since), "until": _iso(until),
                 "projects": [],
-                "totals": {"projects": 0, "minutes": 0, "prompts": 0, "sessions": 0},
+                "totals": {"projects": 0, "minutes": 0, "prompts": 0,
+                           "human_prompts": 0, "sessions": 0},
             })
             sys.exit(1)
         print(f"❌ No {provider} projects with activity found ({PROVIDERS[provider]['location']})")
@@ -1090,6 +1223,7 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
             entry = {"project": r["label"],
                      "minutes": round(r["minutes"], 2),
                      "prompts": r["prompts"],
+                     "human_prompts": r["human_prompts"],
                      "sessions": r["sessions"]}
             if show_tokens:
                 entry["tokens"] = r["tokens"]
@@ -1098,6 +1232,7 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
             "projects": len(rows),
             "minutes": round(grand_minutes, 2),
             "prompts": grand_prompts,
+            "human_prompts": grand_human,
             "sessions": grand_sessions,
         }
         if show_tokens:
@@ -1119,7 +1254,7 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
     print(f"  CLOCKWORK — ALL {_provider_label(provider)} PROJECTS  (idle threshold: {idle_threshold} min)")
     print("=" * width)
     print(f"  Projects: {len(rows)} with activity")
-    print(f"  Prompts : {grand_prompts} total")
+    print(f"  Prompts : {grand_human} total")
     print(f"  Sessions: {grand_sessions} total")
     print(f"  Total   : {fmt_duration(grand_minutes)}")
     if show_tokens:
@@ -1141,7 +1276,7 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
             if len(name) > 29:
                 name = "…" + name[-28:]
             t = r["tokens"]
-            print(f"  {name:<30} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} "
+            print(f"  {name:<30} {fmt_duration(r['minutes']):>9} {r['human_prompts']:>8} "
                   f"{fmt_tokens(t['input']):>8} {fmt_tokens(t['output']):>8} "
                   f"{fmt_tokens(t['cache_read'] + t['cache_write']):>9} "
                   f"{fmt_tokens(t['total']):>9}")
@@ -1150,18 +1285,18 @@ def analyze_all(provider, idle_threshold, since, until, as_json,
                 name = "…" + name[-38:]
             bar_len = int((r["minutes"] / max_mins) * 12) if max_mins else 0
             bar = "█" * bar_len
-            print(f"  {name:<40} {fmt_duration(r['minutes']):>9} {r['prompts']:>8} {r['sessions']:>5}  {bar}")
+            print(f"  {name:<40} {fmt_duration(r['minutes']):>9} {r['human_prompts']:>8} {r['sessions']:>5}  {bar}")
 
     print("-" * width)
     if show_tokens:
-        print(f"  {'TOTAL':<30} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} "
+        print(f"  {'TOTAL':<30} {fmt_duration(grand_minutes):>9} {grand_human:>8} "
               f"{fmt_tokens(grand_tokens['input']):>8} "
               f"{fmt_tokens(grand_tokens['output']):>8} "
               f"{fmt_tokens(grand_tokens['cache_read'] + grand_tokens['cache_write']):>9} "
               f"{fmt_tokens(grand_tokens['total']):>9}")
         _print_model_table(grand_tokens)
     else:
-        print(f"  {'TOTAL':<40} {fmt_duration(grand_minutes):>9} {grand_prompts:>8} {grand_sessions:>5}")
+        print(f"  {'TOTAL':<40} {fmt_duration(grand_minutes):>9} {grand_human:>8} {grand_sessions:>5}")
     print()
 
 
@@ -1181,29 +1316,30 @@ def _period_window(period):
 
 def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False):
     since, until, title = _period_window(period)
-    if show_tokens:
-        projects = PROVIDERS[provider]["scan"]()
-    else:
-        projects = [(label, ts, []) for label, ts in PROVIDERS[provider]["all"]()]
+    projects = _load_projects(provider, show_tokens)
 
     rows = []
     all_events = []
     combined_daily = defaultdict(float)
     prompts_per_day = defaultdict(int)
+    human_per_day = defaultdict(int)
     grand_minutes = 0.0
     grand_prompts = 0
+    grand_human = 0
     grand_sessions = 0
 
-    for label, timestamps, events in projects:
+    for label, timestamps, events, human in projects:
         timestamps = _filter_timestamps(timestamps, since, until)
         if not timestamps:
             continue
+        human = _filter_timestamps(human, since, until)
         events = _filter_events(events, since, until)
         daily, sessions = compute_active_hours(timestamps, idle_threshold)
         rows.append({
             "label": label,
             "minutes": sum(daily.values()),
             "prompts": len(timestamps),
+            "human_prompts": len(human),
             "sessions": len(sessions),
             "tokens": summarize_tokens(events) if show_tokens else None,
         })
@@ -1212,8 +1348,11 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
             combined_daily[day] += mins
         for ts in timestamps:
             prompts_per_day[ts.date()] += 1
+        for ts in human:
+            human_per_day[ts.date()] += 1
         grand_minutes += sum(daily.values())
         grand_prompts += len(timestamps)
+        grand_human += len(human)
         grand_sessions += len(sessions)
 
     rows.sort(key=lambda r: r["minutes"], reverse=True)
@@ -1226,6 +1365,7 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
             entry = {"project": r["label"],
                      "minutes": round(r["minutes"], 2),
                      "prompts": r["prompts"],
+                     "human_prompts": r["human_prompts"],
                      "sessions": r["sessions"]}
             if show_tokens:
                 entry["tokens"] = r["tokens"]
@@ -1234,6 +1374,7 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
             "projects": len(rows),
             "minutes": round(grand_minutes, 2),
             "prompts": grand_prompts,
+            "human_prompts": grand_human,
             "sessions": grand_sessions,
         }
         if show_tokens:
@@ -1246,7 +1387,7 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
             "until": _iso(until),
             "projects": projects_json,
             "days": [
-                _day_entry(day, combined_daily, prompts_per_day,
+                _day_entry(day, combined_daily, prompts_per_day, human_per_day,
                            token_days, show_tokens)
                 for day in _day_keys(combined_daily, token_days)
             ],
@@ -1264,7 +1405,7 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
         print()
         return
     print(f"  Active   : {fmt_duration(grand_minutes)} across {len(rows)} project(s)")
-    print(f"  Prompts  : {grand_prompts}    Sessions: {grand_sessions}")
+    print(f"  Prompts  : {grand_human}    Sessions: {grand_sessions}")
     if show_tokens:
         print(f"  Tokens   : {fmt_tokens(grand_tokens['total'])} across "
               f"{grand_tokens['responses']:,} responses")
@@ -1286,18 +1427,18 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
             if len(name) > 29:
                 name = "…" + name[-28:]
             print(f"  {name:<30} {fmt_duration(r['minutes']):>9} "
-                  f"{r['prompts']:>7} {fmt_tokens(r['tokens']['total']):>9}")
+                  f"{r['human_prompts']:>7} {fmt_tokens(r['tokens']['total']):>9}")
         else:
             if len(name) > 33:
                 name = "…" + name[-32:]
             bar = "█" * (int((r["minutes"] / max_mins) * 10) if max_mins else 0)
-            print(f"  {name:<34} {fmt_duration(r['minutes']):>9} {r['prompts']:>7}  {bar}")
+            print(f"  {name:<34} {fmt_duration(r['minutes']):>9} {r['human_prompts']:>7}  {bar}")
     print("-" * width)
     if show_tokens:
         print(f"  {'TOTAL':<30} {fmt_duration(grand_minutes):>9} "
-              f"{grand_prompts:>7} {fmt_tokens(grand_tokens['total']):>9}")
+              f"{grand_human:>7} {fmt_tokens(grand_tokens['total']):>9}")
     else:
-        print(f"  {'TOTAL':<34} {fmt_duration(grand_minutes):>9} {grand_prompts:>7}")
+        print(f"  {'TOTAL':<34} {fmt_duration(grand_minutes):>9} {grand_human:>7}")
 
     if period == "week":
         print()
@@ -1311,7 +1452,7 @@ def analyze_summary(provider, period, idle_threshold, as_json, show_tokens=False
             cell = (f" {fmt_tokens(token_days.get(day, {}).get('total', 0)):>9}"
                     if show_tokens else "")
             print(f"  {str(day):<12} {fmt_duration(mins):>9} "
-                  f"{prompts_per_day[day]:>7}{cell}  {bar}")
+                  f"{human_per_day[day]:>7}{cell}  {bar}")
     if show_tokens:
         _print_model_table(grand_tokens)
     print()
@@ -1340,38 +1481,42 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize,
     With `show_tokens`, every project, day, provider and the grand totals also
     carry a normalized `tokens` record with a per-model breakdown. The token
     fields are purely additive — a v2 consumer reads a v3 bundle unchanged.
+
+    `prompts` counts every user-role record, tool results included, and keeps
+    that meaning for existing consumers. Wherever it appears (totals, daily,
+    sessions, by_provider, and the raw timestamp list) a `human_prompts`
+    sibling carries the messages a person actually sent. Also additive.
     """
     out_projects = []
     by_provider = {}
     grand_minutes = 0.0
     grand_prompts = 0
+    grand_human = 0
     grand_sessions = 0
     grand_events = []
     name_counter = 0
 
     for prov in _export_providers(provider):
-        if show_tokens:
-            projects = PROVIDERS[prov]["scan"]()
-        else:
-            projects = [(label, ts, []) for label, ts in PROVIDERS[prov]["all"]()]
+        projects = _load_projects(prov, show_tokens)
         p_minutes = 0.0
         p_prompts = 0
+        p_human = 0
         p_sessions = 0
         p_projects = 0
         p_events = []
 
-        for label, timestamps, events in sorted(projects, key=lambda p: p[0]):
+        for label, timestamps, events, human in sorted(projects, key=lambda p: p[0]):
             timestamps = _filter_timestamps(timestamps, since, until)
             if not timestamps:
                 continue
+            human = _filter_timestamps(human, since, until)
             events = _filter_events(events, since, until)
             daily, _ = compute_active_hours(timestamps, idle_threshold)
             sessions = group_sessions(timestamps, idle_threshold)
             total_minutes = sum(daily.values())
 
-            prompts_per_day = defaultdict(int)
-            for ts in timestamps:
-                prompts_per_day[ts.date()] += 1
+            prompts_per_day = _per_day(timestamps)
+            human_per_day = _per_day(human)
 
             token_days = tokens_by_day(events) if show_tokens else {}
 
@@ -1383,13 +1528,15 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize,
                 "totals": {
                     "minutes": round(total_minutes, 2),
                     "prompts": len(timestamps),
+                    "human_prompts": len(human),
                     "sessions": len(sessions),
                     "active_days": len(daily),
                     "first": int(timestamps[0].timestamp()),
                     "last": int(timestamps[-1].timestamp()),
                 },
                 "daily": [
-                    _day_entry(day, daily, prompts_per_day, token_days, show_tokens)
+                    _day_entry(day, daily, prompts_per_day, human_per_day,
+                               token_days, show_tokens)
                     for day in _day_keys(daily, token_days)
                 ],
             }
@@ -1402,16 +1549,20 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize,
                     {"start": int(s.timestamp()),
                      "end": int(e.timestamp()),
                      "minutes": round((e - s).total_seconds() / 60, 2),
-                     "prompts": c}
-                    for s, e, c in sessions
+                     "prompts": c,
+                     "human_prompts": h}
+                    for (s, e, c), h in zip(sessions,
+                                            _human_per_session(sessions, human))
                 ]
             if detail == "raw":
                 proj["prompts"] = [int(ts.timestamp()) for ts in timestamps]
+                proj["human_prompts"] = [int(ts.timestamp()) for ts in human]
 
             out_projects.append(proj)
             p_projects += 1
             p_minutes += total_minutes
             p_prompts += len(timestamps)
+            p_human += len(human)
             p_sessions += len(sessions)
             p_events.extend(events)
 
@@ -1420,12 +1571,14 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize,
                 "projects": p_projects,
                 "minutes": round(p_minutes, 2),
                 "prompts": p_prompts,
+                "human_prompts": p_human,
                 "sessions": p_sessions,
             }
             if show_tokens:
                 by_provider[prov]["tokens"] = summarize_tokens(p_events)
             grand_minutes += p_minutes
             grand_prompts += p_prompts
+            grand_human += p_human
             grand_sessions += p_sessions
             grand_events.extend(p_events)
 
@@ -1441,6 +1594,7 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize,
         "projects": len(out_projects),
         "minutes": round(grand_minutes, 2),
         "prompts": grand_prompts,
+        "human_prompts": grand_human,
         "sessions": grand_sessions,
         "by_provider": by_provider,
     }
@@ -1473,7 +1627,7 @@ def export_data(provider, idle_threshold, since, until, detail, anonymize,
         tags.append("tokens")
     print(f"\n  ✓ export complete → {where}", file=sys.stderr)
     print(f"    {' · '.join(tags)}", file=sys.stderr)
-    print(f"    {len(out_projects)} projects · {grand_prompts:,} prompts "
+    print(f"    {len(out_projects)} projects · {grand_human:,} prompts "
           f"· {grand_sessions:,} sessions · {grand_minutes / 60:.1f}h active",
           file=sys.stderr)
     if show_tokens:

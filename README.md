@@ -36,11 +36,28 @@ DATE           ACTIVE TIME    PROMPTS    BAR
 ## How it works
 
 `clockwork` reads the JSONL transcripts each tool writes, extracts the
-timestamps of your **prompts** (not the assistant's replies), and groups them
+timestamps of user-side activity (not the assistant's replies), and groups them
 into sessions. Any gap longer than the *idle threshold* (default 30 minutes)
 starts a new session. A session's duration is the time from its first to its
-last prompt, split across calendar-day boundaries so a session that crosses
+last record, split across calendar-day boundaries so a session that crosses
 midnight is credited to each day it spans.
+
+**Prompts vs. activity.** On Claude, most user-side records aren't things you
+typed: the API sends every tool result back to the model as a user message.
+Those records still count as *activity*, because they show Claude working
+through a long tool run, so sessions and active time are built on all of them.
+The **Prompts** column counts only messages a person sent. Claude Code tags
+these with `origin.kind: "human"` in newer logs; older records are classified by
+shape, so tool results, slash-command output, `!` shell output, meta records,
+task notifications, and interrupt markers are left out. Text typed while a tool
+was running is counted. Codex logs tool output separately, so its prompt count
+already means the same thing.
+
+In JSON output, `prompts` keeps its original meaning (every user-side record)
+so existing consumers don't break, and `human_prompts` carries the corrected
+count. Claude Code's Insights report counts more broadly than `human_prompts`
+does (it includes slash commands, shell output, and interrupts), so expect
+Insights' "messages" to run higher.
 
 **Data sources**
 
@@ -321,11 +338,15 @@ for a combined view, so nothing is lost either way.
       "name": "myproject",   // basename, or "project-N" when anonymized
       "path": "/Users/you/dev/myproject",   // omitted when anonymized
       "totals": {
-        "minutes": 1234.76, "prompts": 1646, "sessions": 27,
+        "minutes": 1234.76,
+        "prompts": 1646,       // every user-side record, tool results included
+        "human_prompts": 231,  // messages a person sent
+        "sessions": 27,
         "active_days": 12,
         "first": 1780521570, "last": 1782130426   // epoch seconds
       },
-      "daily":    [ { "date": "2026-06-03", "minutes": 4.34, "prompts": 27 } ],
+      "daily":    [ { "date": "2026-06-03", "minutes": 4.34, "prompts": 27,
+                      "human_prompts": 4 } ],
       // every "tokens" block below appears only with --tokens
       "tokens": {
         "responses": 373,    // API responses, deduplicated
@@ -340,22 +361,31 @@ for a combined view, so nothing is lost either way.
         ]
       },
       "sessions": [ { "start": 1780521570, "end": 1780521830,
-                      "minutes": 4.34, "prompts": 27 } ],  // detail >= sessions
-      "prompts":  [ 1780521570, 1780521582 ]               // detail == raw
+                      "minutes": 4.34, "prompts": 27,
+                      "human_prompts": 4 } ],               // detail >= sessions
+      "prompts":  [ 1780521570, 1780521582 ],              // detail == raw
+      "human_prompts": [ 1780521570 ]                      // detail == raw
     }
   ],
   "totals": {
-    "projects": 6, "minutes": 3392.97, "prompts": 4588, "sessions": 64,
+    "projects": 6, "minutes": 3392.97, "prompts": 4588, "human_prompts": 950,
+    "sessions": 64,
     "tokens": { /* same shape, summed across every project */ },
     "by_provider": {
-      "claude": { "projects": 4, "minutes": 2500.0, "prompts": 3000, "sessions": 40,
-                  "tokens": { /* ... */ } },
-      "codex":  { "projects": 2, "minutes": 892.97, "prompts": 1588, "sessions": 24,
-                  "tokens": { /* ... */ } }
+      "claude": { "projects": 4, "minutes": 2500.0, "prompts": 3000,
+                  "human_prompts": 420, "sessions": 40, "tokens": { /* ... */ } },
+      "codex":  { "projects": 2, "minutes": 892.97, "prompts": 1588,
+                  "human_prompts": 530, "sessions": 24, "tokens": { /* ... */ } }
     }
   }
 }
 ```
+
+`human_prompts` sits beside every `prompts` field. It was added inside
+`clockwork/v3` without a version bump, because nothing existing changed
+meaning: a consumer that doesn't know the field reads the bundle as before. If
+you display a prompt count, read `human_prompts` when it's present and fall
+back to `prompts` for older bundles.
 
 All instants are **UTC-based epoch seconds** (`new Date(sec * 1000)` in JS), so
 the consumer picks the display timezone. The `schema` field is the version

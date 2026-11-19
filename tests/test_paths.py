@@ -52,7 +52,7 @@ def test_scan_labels_projects_with_their_real_cwd(claude_dir):
     ])
     (claude_dir / ".DS_Store").write_text("")
 
-    labels = [label for label, _, _ in clockwork_cli.claude_scan()]
+    labels = [label for label, _, _, _ in clockwork_cli.claude_scan()]
     assert labels == ["/Users/you/dev/team-5"]
 
 
@@ -60,7 +60,7 @@ def test_scan_falls_back_to_decoded_name_without_a_matching_cwd(claude_dir):
     write_jsonl(claude_dir / "-Users-you-old" / "s1.jsonl", [
         {"type": "user", "timestamp": "2026-07-01T10:00:00.000Z"},
     ])
-    labels = [label for label, _, _ in clockwork_cli.claude_scan()]
+    labels = [label for label, _, _, _ in clockwork_cli.claude_scan()]
     assert labels == ["/Users/you/old"]
 
 
@@ -74,7 +74,7 @@ def test_scan_reads_subagent_logs_for_tokens(claude_dir):
          "message": {"id": "msg_s", "model": "claude-haiku-5",
                      "usage": {"input_tokens": 1, "output_tokens": 9}}},
     ])
-    [(label, ts, events)] = clockwork_cli.claude_scan()
+    [(label, ts, events, _)] = clockwork_cli.claude_scan()
     assert label == "/Users/you/alpha"
     assert len(ts) == 1
     assert [e["model"] for e in events] == ["claude-haiku-5"]
@@ -84,7 +84,7 @@ def test_single_project_path_with_special_characters_resolves(claude_dir):
     write_jsonl(claude_dir / "-Users-you-I2DL-exercise-01" / "s1.jsonl", [
         user("2026-07-01T10:00:00.000Z", "/Users/you/I2DL/exercise_01"),
     ])
-    folder, count, ts, _ = clockwork_cli.claude_scan_single(
+    folder, count, ts, _, _ = clockwork_cli.claude_scan_single(
         "/Users/you/I2DL/exercise_01")
     assert folder == "-Users-you-I2DL-exercise-01"
     assert count == 1 and len(ts) == 1
