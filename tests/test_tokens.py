@@ -17,8 +17,13 @@ from datetime import datetime, timezone
 
 import pytest
 
+import os
+import shutil
+import subprocess
+
 from clockwork_cli import (
     _claude_scan_files,
+    _codex_files,
     _codex_scan_file,
     summarize_tokens,
     tokens_by_day,
@@ -224,6 +229,38 @@ def test_codex_returns_cwd_and_prompts(codex_log):
     cwd, timestamps, _, _ = _codex_scan_file(codex_log)
     assert cwd == "/Users/you/dev/alpha"
     assert len(timestamps) == 1
+
+
+def _zstd_compress(src):
+    dst = str(src) + ".zst"
+    try:
+        from compression import zstd
+        with open(src, "rb") as fh, open(dst, "wb") as out:
+            out.write(zstd.compress(fh.read()))
+    except ImportError:
+        if not shutil.which("zstd"):
+            pytest.skip("no zstd compressor available")
+        subprocess.run(["zstd", "-q", "-f", str(src), "-o", dst], check=True)
+    return dst
+
+
+def test_codex_reads_zstd_rollouts(codex_log):
+    # Newer Codex saves finished rollouts as rollout-*.jsonl.zst.
+    zst = _zstd_compress(codex_log)
+    assert _codex_scan_file(zst) == _codex_scan_file(codex_log)
+
+
+def test_codex_files_finds_zst_and_counts_each_rollout_once(tmp_path, monkeypatch):
+    day = tmp_path / "sessions" / "2026" / "07" / "01"
+    day.mkdir(parents=True)
+    for name in ("rollout-a.jsonl", "rollout-b.jsonl.zst",
+                 "rollout-c.jsonl", "rollout-c.jsonl.zst", "other.jsonl"):
+        (day / name).write_bytes(b"")
+    os.utime(day / "rollout-c.jsonl", (1, 1))  # the .zst is newer
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    names = sorted(os.path.basename(f) for f in _codex_files())
+    assert names == ["rollout-a.jsonl", "rollout-b.jsonl.zst", "rollout-c.jsonl.zst"]
 
 
 def codex_user_item(ts, text):
