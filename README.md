@@ -56,11 +56,11 @@ midnight is credited to each day it spans.
 > reasonable estimate, not a stopwatch.
 
 > **`both` and path matching:** `both` combines Claude and Codex prompts by
-> project path. Single-project mode (`clockwork both ~/dev/x`) is exact,
-> because it encodes the path you pass. In `all` / `export` / `list`, projects
-> are matched by their displayed path — and Claude stores paths dash-encoded,
-> so one containing spaces or dashes can't always be reversed to match Codex's
-> real path. Such a project may appear as two rows rather than merging.
+> project path. Claude's folder names are lossy (every character that isn't a
+> letter or digit becomes `-`), so clockwork labels each Claude project with
+> the real `cwd` recorded in its logs, which then lines up with Codex's path.
+> Only a folder whose logs carry no matching `cwd` falls back to a decoded
+> guess, and that guess may appear as a separate row rather than merging.
 
 ## Requirements
 

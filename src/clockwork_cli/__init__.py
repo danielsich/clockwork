@@ -352,9 +352,20 @@ def _display_name(path):
 # Claude backend  (~/.claude/projects/<encoded-path>/*.jsonl)
 # --------------------------------------------------------------------------- #
 
+def _claude_encode_path(path):
+    """Encode a path the way Claude Code names its per-project log folder.
+
+    Every character that is not an ASCII letter or digit becomes `-`, so
+    `/a/team-5/My Drive` and `/a/team/5/My-Drive` both encode to
+    `-a-team-5-My-Drive`. That makes the encoding lossy; see
+    `_claude_folder_cwd` for recovering the real path.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
 def path_to_claude_folder(project_path):
     abs_path = os.path.abspath(os.path.expanduser(project_path))
-    folder_name = abs_path.replace("/", "-").replace("\\", "-").replace(":", "-")
+    folder_name = _claude_encode_path(abs_path)
     if folder_name.startswith("-"):
         folder_name = folder_name[1:]
     return folder_name
@@ -481,6 +492,33 @@ def _claude_folder_to_pretty(folder):
     return "/" + folder.lstrip("-").replace("-", "/")
 
 
+def _claude_folder_cwd(folder, files):
+    """The project's real path, read from the `cwd` its records carry.
+
+    The folder name can't be decoded reliably (`team-5` and `team/5` encode
+    alike), and a wrong decode both mislabels the project and stops `both`
+    from merging it with the Codex rollouts for the same path. Every Claude
+    record carries `cwd`, so take the first one that encodes back to this
+    folder's name. The check matters because a session that `cd`s elsewhere
+    records the new cwd. Falls back to the decoded name if nothing matches.
+    """
+    for f in sorted(files):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                for line in fh:
+                    if '"cwd"' not in line:
+                        continue
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+                    if cwd and _claude_encode_path(cwd) == folder:
+                        return cwd
+        except OSError:
+            continue
+    return _claude_folder_to_pretty(folder)
+
+
 def claude_scan_single(project_path):
     folder, files, subagents = _claude_resolve_files(project_path)
     if not files:
@@ -500,7 +538,7 @@ def claude_scan():
         files, subagents = _claude_session_files(os.path.join(CLAUDE_DIR, folder))
         ts, events = _claude_scan_files(files, subagents)
         if ts:
-            result.append((_claude_folder_to_pretty(folder), ts, events))
+            result.append((_claude_folder_cwd(folder, files), ts, events))
     return result
 
 
@@ -509,7 +547,11 @@ def claude_all():
 
 
 def _claude_list_folders():
-    return sorted(os.listdir(CLAUDE_DIR)) if os.path.exists(CLAUDE_DIR) else []
+    if not os.path.exists(CLAUDE_DIR):
+        return []
+    # Skip stray files such as macOS's .DS_Store; only folders hold logs.
+    return sorted(name for name in os.listdir(CLAUDE_DIR)
+                  if os.path.isdir(os.path.join(CLAUDE_DIR, name)))
 
 
 def claude_list():
@@ -762,7 +804,10 @@ def both_all():
 
 
 def both_list():
-    labels = {_claude_folder_to_pretty(f) for f in _claude_list_folders()}
+    labels = {
+        _claude_folder_cwd(f, glob.glob(os.path.join(CLAUDE_DIR, f, "*.jsonl")))
+        for f in _claude_list_folders()
+    }
     labels.update(codex_list())
     return sorted(labels)
 
