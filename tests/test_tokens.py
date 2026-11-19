@@ -192,6 +192,52 @@ def test_codex_returns_cwd_and_prompts(codex_log):
     assert len(timestamps) == 1
 
 
+def codex_user_item(ts, text):
+    return {"timestamp": ts, "type": "event_msg",
+            "payload": {"type": "item_completed",
+                        "item": {"type": "UserMessage",
+                                 "content": [{"type": "text", "text": text}]}}}
+
+
+def codex_response_user(ts, text):
+    return {"timestamp": ts, "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": text}]}}
+
+
+def test_codex_newer_rollouts_read_prompts_from_user_message_items(tmp_path):
+    """Newer rollouts dropped `user_message`; typed input is a `UserMessage`
+    item. The `response_item` copies, which include injected context, must
+    not be counted alongside or instead of it."""
+    path = write_jsonl(tmp_path / "rollout-new.jsonl", [
+        {"type": "session_meta", "timestamp": "2026-11-09T14:22:00.000Z",
+         "payload": {"cwd": "/Users/you/dev/alpha"}},
+        codex_response_user("2026-11-09T14:22:01.000Z",
+                            "<environment_context>…</environment_context>"),
+        codex_response_user("2026-11-09T14:22:02.000Z", "first prompt"),
+        codex_user_item("2026-11-09T14:22:02.000Z", "first prompt"),
+        # Tool work is logged as items too and must not count as prompts.
+        {"timestamp": "2026-11-09T14:22:05.000Z", "type": "event_msg",
+         "payload": {"type": "item_completed",
+                     "item": {"type": "CommandExecution"}}},
+        codex_response_user("2026-11-09T14:30:00.000Z", "second prompt"),
+        codex_user_item("2026-11-09T14:30:00.000Z", "second prompt"),
+    ])
+    _, timestamps, _ = _codex_scan_file(path)
+
+    assert [t.minute for t in timestamps] == [22, 30]
+
+
+def test_codex_falls_back_to_response_items_when_nothing_else(tmp_path):
+    path = write_jsonl(tmp_path / "rollout-old.jsonl", [
+        {"type": "session_meta", "timestamp": "2026-07-01T09:00:00.000Z",
+         "payload": {"cwd": "/Users/you/dev/alpha"}},
+        codex_response_user("2026-07-01T09:01:00.000Z", "hi"),
+    ])
+    _, timestamps, _ = _codex_scan_file(path)
+    assert len(timestamps) == 1
+
+
 def test_codex_missing_file_is_survivable(tmp_path):
     cwd, timestamps, events = _codex_scan_file(str(tmp_path / "nope.jsonl"))
     assert (cwd, timestamps, events) == (None, [], [])

@@ -31,7 +31,8 @@ residual is edge-case classification (pasted attachments, some meta records)
 rather than a different definition.
 
 The Codex reader does not have this problem. It counts canonical
-`event_msg → user_message` records (`clockwork:566`) and never sees tool
+`event_msg → user_message` records, or the `item_completed` → `UserMessage`
+items that replaced them in newer rollouts, and never sees tool
 output, because Codex logs that separately as
 `response_item → function_call_output` / `custom_tool_call_output`, which the
 reader ignores. In my rollouts the ignored tool outputs outnumbered the human
@@ -74,9 +75,11 @@ versions.
 ### The same asymmetry runs backwards for active time
 
 Fixing `prompts` alone leaves a matching defect in place, pointing the other
-way. `_codex_scan_file` builds its timestamp list from `user_message` events
-only, falling back to `response_item` user-role messages; it never reads
-`function_call_output` or `custom_tool_call_output`. Codex activity is
+way. `_codex_scan_file` builds its timestamp list from prompt records only
+(`user_message`, then `UserMessage` items, then `response_item` user-role
+messages); it never reads `function_call_output`, `custom_tool_call_output`,
+or the tool-side `item_completed` items (`CommandExecution`, `McpToolCall`,
+`FileChange`). Codex activity is
 therefore already prompt only, which is exactly the state the section above
 rejects for Claude, and for the same reason: a long Codex tool run with no
 human input reads as idle and splits into separate sessions.

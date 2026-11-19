@@ -532,15 +532,21 @@ def _codex_token_event(record, payload, running, model):
 def _codex_scan_file(path):
     """Return (cwd, [timestamps], [token events]) for one rollout file.
 
-    Uses the canonical `event_msg -> user_message` prompt records; only falls
-    back to `response_item` user-role messages for files that contain no
-    canonical prompt events, to avoid double counting the same input.
+    Prompts come from the first of these sources that the file contains, so
+    the same input is never counted twice:
+
+      1. `event_msg -> user_message`, the canonical record in older rollouts
+      2. `event_msg -> item_completed` with a `UserMessage` item, which
+         replaced it in newer rollouts
+      3. `response_item` user-role messages, as a last resort. These also
+         carry injected context (environment, AGENTS.md), so they overcount.
 
     The model is not in `session_meta` (which only names the provider) — it
     rides on `turn_context`, so each turn is attributed to the most recent one.
     """
     cwd = None
     canonical = []
+    items = []
     fallback = []
     events = []
     model = None
@@ -568,6 +574,12 @@ def _codex_scan_file(path):
                     dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
                     if dt:
                         canonical.append(dt)
+                elif (t == "event_msg"
+                      and payload.get("type") == "item_completed"
+                      and (payload.get("item") or {}).get("type") == "UserMessage"):
+                    dt = _parse_ts(d.get("timestamp"))
+                    if dt:
+                        items.append(dt)
                 elif t == "event_msg" and payload.get("type") == "token_count":
                     event = _codex_token_event(d, payload, running, model)
                     if event:
@@ -586,7 +598,8 @@ def _codex_scan_file(path):
         for event in events:
             if event["model"] is None:
                 event["model"] = first_model
-    return cwd, sorted(canonical if canonical else fallback), events
+    prompts = canonical or items or fallback
+    return cwd, sorted(prompts), events
 
 
 def _codex_parse_file(path):
