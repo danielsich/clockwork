@@ -11,8 +11,9 @@ your own logs before acting on any of this.
 
 ## 1. `prompts` counts tool results, not prompts (Claude side)
 
-Status: the Claude prompt count is fixed and ships as a new field,
-`human_prompts`. The matching Codex activity gap (below) is still open.
+Status: fixed. The Claude prompt count ships as a new field, `human_prompts`,
+and Codex activity now counts tool results the way Claude's does. What's left
+is the meter-side decision under "Still to decide".
 
 ### The problem
 
@@ -54,7 +55,7 @@ Every backend now returns two timestamp streams per project:
   time use these, so totals did not move.
 - Human: messages a person sent. Counted as `human_prompts` everywhere
   `prompts` appears (totals, `daily[]`, `sessions[]`, `by_provider`, and the
-  `--detail raw` timestamp list). For Codex the two streams are the same list.
+  `--detail raw` timestamp list).
 
 `prompts` keeps its old meaning, so existing consumers do not break, and the
 export stays `clockwork/v3`. The ASCII tables show `human_prompts` under
@@ -77,26 +78,35 @@ Classification (`_claude_is_human_prompt`), re-derived from the logs:
   replays earlier messages into its new log. Activity is not deduplicated
   (duplicates cost no time).
 
-### The same asymmetry runs backwards for active time (open)
+### The same asymmetry ran backwards for active time (fixed)
 
-`_codex_scan_file` builds its timestamp list from prompt records only
-(`user_message`, then `UserMessage` items, then `response_item` user-role
-messages); it never reads `function_call_output`, `custom_tool_call_output`,
-or the tool-side `item_completed` items (`CommandExecution`, `McpToolCall`,
-`FileChange`). Codex activity is therefore prompt only, which is exactly the
-state the section above rejects for Claude, and for the same reason: a long
-Codex tool run with no human input reads as idle and splits into separate
-sessions.
+Codex activity used to be prompt records only, so a long Codex tool run with no
+human input read as idle and split into separate sessions, while Claude's
+timeline counted its tool results. `_codex_scan_file` now adds
+`function_call_output` and `custom_tool_call_output` timestamps to the Codex
+activity stream and keeps its prompts in a separate list, which is the Claude
+rule. On my rollouts that raised Codex active time by a high single-digit
+percentage and left the prompt count unchanged.
 
-Claude subagent transcripts (`<session>/subagents/*.jsonl`) sit in the same
-gap. They are read for tokens only, since their user-role records are task
-prompts and tool results; their timestamps belong in the activity stream.
+Side effect: Codex's JSON `prompts` (the activity count) now includes tool
+results, so it jumped by several times. That matches what `prompts` has always
+meant on Claude. Anything that wants the number of messages sent should read
+`human_prompts`.
 
-That makes `both` mode compare a tool-aware timeline against a prompt-only one,
-so Codex active time is understated relative to Claude by roughly the margin
-that the filtering experiment above measured. The fix is to add the tool-side
-records to the Codex activity stream, leaving its human stream as it is. That
-changes Codex active time, so compare totals before and after.
+Claude subagent transcripts (`<session>/subagents/*.jsonl`) stay out of the
+activity stream, and this is closed rather than deferred. Adding their records
+changed neither active time nor session count on my logs: a subagent runs
+while its parent session waits, and the parent's tool result lands when it
+finishes, so the gap is already covered at the default 30-minute threshold.
+It would only matter for a single subagent running past the idle threshold.
+Subagent logs are still read for tokens.
+
+Considered and rejected: counting every timestamped record as activity. It is
+the simplest rule but it is wrong for Claude, because Claude Code writes an
+`away_summary` system record when you come back from being away, which turns
+idle time into active time. Counting assistant records as well (a session ends
+at the model's last reply, not its last tool result) is defensible and would
+nudge Claude totals up slightly; it is a possible follow-up, not a defect.
 
 ### Still to decide
 
@@ -119,9 +129,10 @@ genuine-looking typed message per session in a minority of sessions, for
 reasons I could not pin down (some, not all, sit on rewound branches). Those
 stay counted.
 
-The regression check that matters: active time, sessions and `prompts` must be
-identical to the previous build, project by project, over a fixed `--until`
-window. They were.
+The regression check that matters: Claude active time, sessions and `prompts`
+must be identical to the previous build, project by project, over a fixed
+`--until` window. They were. Codex active time is expected to rise (tool
+results now count) while its `human_prompts` stays put.
 
 ---
 

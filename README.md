@@ -50,12 +50,15 @@ The **Prompts** column counts only messages a person sent. Claude Code tags
 these with `origin.kind: "human"` in newer logs; older records are classified by
 shape, so tool results, slash-command output, `!` shell output, meta records,
 task notifications, and interrupt markers are left out. Text typed while a tool
-was running is counted. Codex logs tool output separately, so its prompt count
-already means the same thing.
+was running is counted. Codex follows the same rule: its activity is your
+prompts plus every tool result (`function_call_output`,
+`custom_tool_call_output`), and its Prompts column is your prompts only.
 
-In JSON output, `prompts` keeps its original meaning (every user-side record)
-so existing consumers don't break, and `human_prompts` carries the corrected
-count. Claude Code's Insights report counts more broadly than `human_prompts`
+In JSON output, `prompts` is the activity count (every user-side record, tool
+results included) on both providers, so Claude consumers see the meaning they
+always had, and `human_prompts` carries the corrected count. On Codex,
+`prompts` used to count prompts only and now includes tool results too; read
+`human_prompts` for the number of messages you sent. Claude Code's Insights report counts more broadly than `human_prompts`
 does (it includes slash commands, shell output, and interrupts), so expect
 Insights' "messages" to run higher.
 

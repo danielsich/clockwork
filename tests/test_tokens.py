@@ -194,7 +194,7 @@ def codex_log(tmp_path):
 
 
 def test_codex_ignores_stale_reemitted_usage(codex_log):
-    _, _, events = _codex_scan_file(codex_log)
+    _, _, events, _ = _codex_scan_file(codex_log)
 
     # Four token_count records, but the aborted turn moved nothing.
     assert len(events) == 3
@@ -202,7 +202,7 @@ def test_codex_ignores_stale_reemitted_usage(codex_log):
 
 
 def test_codex_splits_cache_out_of_input(codex_log):
-    _, _, events = _codex_scan_file(codex_log)
+    _, _, events, _ = _codex_scan_file(codex_log)
     first = events[0]
 
     # Codex counts cached_input_tokens *inside* input_tokens; clockwork pulls it
@@ -214,14 +214,14 @@ def test_codex_splits_cache_out_of_input(codex_log):
 
 
 def test_codex_attributes_turns_to_the_preceding_model(codex_log):
-    _, _, events = _codex_scan_file(codex_log)
+    _, _, events, _ = _codex_scan_file(codex_log)
     # The pre-turn_context turn is back-filled with the session's first model
     # rather than being lost to "unknown".
     assert [e["model"] for e in events] == ["gpt-A", "gpt-A", "gpt-B"]
 
 
 def test_codex_returns_cwd_and_prompts(codex_log):
-    cwd, timestamps, _ = _codex_scan_file(codex_log)
+    cwd, timestamps, _, _ = _codex_scan_file(codex_log)
     assert cwd == "/Users/you/dev/alpha"
     assert len(timestamps) == 1
 
@@ -257,7 +257,7 @@ def test_codex_newer_rollouts_read_prompts_from_user_message_items(tmp_path):
         codex_response_user("2026-11-09T14:30:00.000Z", "second prompt"),
         codex_user_item("2026-11-09T14:30:00.000Z", "second prompt"),
     ])
-    _, timestamps, _ = _codex_scan_file(path)
+    _, _, _, timestamps = _codex_scan_file(path)
 
     assert [t.minute for t in timestamps] == [22, 30]
 
@@ -268,13 +268,31 @@ def test_codex_falls_back_to_response_items_when_nothing_else(tmp_path):
          "payload": {"cwd": "/Users/you/dev/alpha"}},
         codex_response_user("2026-07-01T09:01:00.000Z", "hi"),
     ])
-    _, timestamps, _ = _codex_scan_file(path)
+    _, _, _, timestamps = _codex_scan_file(path)
     assert len(timestamps) == 1
 
 
 def test_codex_missing_file_is_survivable(tmp_path):
-    cwd, timestamps, events = _codex_scan_file(str(tmp_path / "nope.jsonl"))
-    assert (cwd, timestamps, events) == (None, [], [])
+    assert _codex_scan_file(str(tmp_path / "nope.jsonl")) == (None, [], [], [])
+
+
+def test_codex_tool_outputs_count_as_activity_not_prompts(tmp_path):
+    """A long tool run with no human input is still work, not idle time."""
+    def tool_output(ts, kind):
+        return {"timestamp": ts, "type": "response_item",
+                "payload": {"type": kind, "call_id": "c1", "output": "ok"}}
+    path = write_jsonl(tmp_path / "rollout-tools.jsonl", [
+        {"type": "session_meta", "timestamp": "2026-11-09T14:00:00.000Z",
+         "payload": {"cwd": "/Users/you/dev/alpha"}},
+        codex_user_item("2026-11-09T14:00:00.000Z", "run the migration"),
+        # 40 minutes of tool calls, each gap under the 30-minute threshold.
+        tool_output("2026-11-09T14:20:00.000Z", "function_call_output"),
+        tool_output("2026-11-09T14:40:00.000Z", "custom_tool_call_output"),
+    ])
+    _, activity, _, prompts = _codex_scan_file(path)
+
+    assert [t.minute for t in activity] == [0, 20, 40]
+    assert [t.minute for t in prompts] == [0]
 
 
 # --------------------------------------------------------------------------- #
@@ -282,7 +300,7 @@ def test_codex_missing_file_is_survivable(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_summary_reconciles_with_per_model_breakdown(codex_log):
-    _, _, events = _codex_scan_file(codex_log)
+    _, _, events, _ = _codex_scan_file(codex_log)
     summary = summarize_tokens(events)
 
     assert summary["responses"] == 3

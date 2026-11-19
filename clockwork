@@ -674,8 +674,17 @@ def _codex_token_event(record, payload, running, model):
     }
 
 
+# Records that carry a tool's result back to the model. Counted as activity.
+_CODEX_TOOL_OUTPUTS = ("function_call_output", "custom_tool_call_output")
+
+
 def _codex_scan_file(path):
-    """Return (cwd, [timestamps], [token events]) for one rollout file.
+    """Return (cwd, [activity], [token events], [prompts]) for one rollout.
+
+    Activity is the prompts plus every tool result (`function_call_output`,
+    `custom_tool_call_output`), the same rule the Claude reader uses: a long
+    tool run with no human input is still work, not idle time. Prompts stay a
+    separate list, so tool results never count as something a person typed.
 
     Prompts come from the first of these sources that the file contains, so
     the same input is never counted twice:
@@ -693,6 +702,7 @@ def _codex_scan_file(path):
     canonical = []
     items = []
     fallback = []
+    tool_outputs = []
     events = []
     model = None
     first_model = None
@@ -735,22 +745,21 @@ def _codex_scan_file(path):
                     dt = _parse_ts(d.get("timestamp") or payload.get("timestamp"))
                     if dt:
                         fallback.append(dt)
+                elif (t == "response_item"
+                      and payload.get("type") in _CODEX_TOOL_OUTPUTS):
+                    dt = _parse_ts(d.get("timestamp"))
+                    if dt:
+                        tool_outputs.append(dt)
     except OSError:
-        return None, [], []
+        return None, [], [], []
     # A few turns are logged before the first `turn_context`; credit them to
     # the model the session went on to use rather than losing them to unknown.
     if first_model:
         for event in events:
             if event["model"] is None:
                 event["model"] = first_model
-    prompts = canonical or items or fallback
-    return cwd, sorted(prompts), events
-
-
-def _codex_parse_file(path):
-    """Return (cwd, [timestamps]) for one rollout file."""
-    cwd, timestamps, _ = _codex_scan_file(path)
-    return cwd, timestamps
+    prompts = sorted(canonical or items or fallback)
+    return cwd, sorted(prompts + tool_outputs), events, prompts
 
 
 def codex_scan_single(project_path):
@@ -758,18 +767,17 @@ def codex_scan_single(project_path):
     matched = 0
     timestamps = []
     events = []
+    human = []
     for f in _codex_files():
-        cwd, file_ts, file_events = _codex_scan_file(f)
+        cwd, file_ts, file_events, file_human = _codex_scan_file(f)
         if cwd == abs_path:
             matched += 1
             timestamps.extend(file_ts)
             events.extend(file_events)
+            human.extend(file_human)
     if not matched:
         return None, 0, [], [], []
-    # Codex prompts are already the messages a person sent (tool output is
-    # logged under other record types), so the human stream is the same list.
-    timestamps.sort()
-    return abs_path, matched, timestamps, events, timestamps
+    return abs_path, matched, sorted(timestamps), events, sorted(human)
 
 
 def codex_single(project_path):
@@ -780,16 +788,15 @@ def codex_single(project_path):
 def codex_scan():
     ts_groups = defaultdict(list)
     event_groups = defaultdict(list)
+    human_groups = defaultdict(list)
     for f in _codex_files():
-        cwd, file_ts, file_events = _codex_scan_file(f)
+        cwd, file_ts, file_events, file_human = _codex_scan_file(f)
         if cwd and file_ts:
             ts_groups[cwd].extend(file_ts)
             event_groups[cwd].extend(file_events)
-    result = []
-    for cwd, ts in ts_groups.items():
-        ts.sort()
-        result.append((cwd, ts, event_groups[cwd], ts))  # human == activity
-    return result
+            human_groups[cwd].extend(file_human)
+    return [(cwd, sorted(ts), event_groups[cwd], sorted(human_groups[cwd]))
+            for cwd, ts in ts_groups.items()]
 
 
 def codex_all():
